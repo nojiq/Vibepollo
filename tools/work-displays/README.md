@@ -30,7 +30,8 @@ The helper:
   restarted after the same 5-second grace, while an unavailable `ss` probe is
   treated as unknown and never kills a healthy stream;
 - retries every exit from a stream it started, including a clean exit during a
-  host restart; a pre-existing Moonlight stream is left alone in manual hold.
+  host restart; a pre-existing Moonlight stream is left alone in manual hold,
+  and the hold clears automatically after that stream disappears.
 
 It never writes `Moonlight.conf`, changes pairing, or modifies Moonlight's
 video settings. The stream flags are the existing Surface profile:

@@ -383,6 +383,10 @@ namespace rtsp_stream {
    */
   std::list<std::string> get_all_session_client_uuids();
 
+  // Snapshot only: safe while the caller holds the stream lifecycle gate.
+  // Unlike get_all_session_client_uuids(), this never joins stopped sessions.
+  std::list<std::string> get_all_session_client_uuids_no_cleanup();
+
   /**
    * @brief Stop any active sessions for a given client UUID.
    * @return True if one or more sessions were stopped.

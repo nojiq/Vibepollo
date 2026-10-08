@@ -6755,7 +6755,7 @@ namespace nvhttp {
             std::lock_guard lock {mac_remote_expiry_mutex};
             expired = mac_remote_expiry.expired(std::chrono::steady_clock::now());
           }
-          const auto active = rtsp_stream::get_all_session_client_uuids();
+          const auto active = rtsp_stream::get_all_session_client_uuids_no_cleanup();
           for (const auto &[uuid, generation] : expired) {
             if (std::find(active.begin(), active.end(), uuid) != active.end()) continue;
             if (remote_owner_generation(uuid, remote_session::role_e::monitor) != generation) continue;

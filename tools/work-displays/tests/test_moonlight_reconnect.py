@@ -361,6 +361,33 @@ UNCONN 0 0 192.168.8.134:42003 0.0.0.0:* users:((\"moonlight\",pid=101,fd=44))
         self.assertTrue(controller.manual_hold)
         self.assertEqual(controller.starts, 0)
 
+    def test_manual_hold_clears_when_preexisting_stream_disappears(self):
+        class FakeController(module.ReconnectController):
+            def network_present(self):
+                return True
+
+            def attempt_start(self):
+                self.starts += 1
+                return False
+
+            def __init__(self, proc_root):
+                super().__init__(module.Settings(), proc_root=proc_root)
+                self.starts = 0
+
+        with tempfile.TemporaryDirectory() as proc_root:
+            pid_dir = pathlib.Path(proc_root) / "101"
+            pid_dir.mkdir()
+            cmdline = pid_dir / "cmdline"
+            cmdline.write_bytes(b"moonlight\0stream\0Resume\0")
+            controller = FakeController(proc_root)
+            controller.step()
+            self.assertTrue(controller.manual_hold)
+            cmdline.unlink()
+            controller.step()
+
+        self.assertFalse(controller.manual_hold)
+        self.assertEqual(controller.starts, 1)
+
     def test_lingering_failed_cli_is_restarted_after_startup_deadline(self):
         class FakeProcess:
             pid = 4242

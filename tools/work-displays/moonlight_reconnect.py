@@ -570,7 +570,12 @@ class ReconnectController:
         if self.process is not None:
             self._check_stream_health(now)
             return
-        if self.manual_hold or now < self.next_retry_at:
+        if self.manual_hold:
+            if existing_stream_pids(proc_root=self.proc_root):
+                return
+            self.manual_hold = False
+            self.logger.info("pre-existing Moonlight stream ended; resuming reconnect")
+        if now < self.next_retry_at:
             return
         if existing_stream_pids(proc_root=self.proc_root):
             self.manual_hold = True

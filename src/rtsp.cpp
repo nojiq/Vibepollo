@@ -1798,6 +1798,10 @@ namespace rtsp_stream {
     return server.get_all_client_uuids();
   }
 
+  std::list<std::string> get_all_session_client_uuids_no_cleanup() {
+    return server.get_all_client_uuids();
+  }
+
   bool disconnect_client_sessions(const std::string &client_uuid) {
     return disconnect_client_sessions_with_result(client_uuid).disconnected;
   }
