@@ -827,7 +827,6 @@ namespace platf::macos_virtual_display {
     }
 
     // A new mode gets a new display: two at once with the same serial would confuse macOS.
-    layout_observer.topology_changed(std::chrono::steady_clock::now());
     remote.display.reset();
     publish_remote_ids();
     NSString *name = client_label.empty() ? @PROJECT_NAME " Remote Monitor" : @(client_label.c_str());
@@ -848,7 +847,6 @@ namespace platf::macos_virtual_display {
 
   bool remote_apply_composed_topology(const std::vector<remote_display_topology::node_t> &composed) {
     std::lock_guard lock {remote_mutex};
-    layout_observer.topology_changed(std::chrono::steady_clock::now());
     CGDisplayConfigRef config;
     if (CGBeginDisplayConfiguration(&config) != kCGErrorSuccess) {
       return false;
@@ -915,6 +913,10 @@ namespace platf::macos_virtual_display {
       // Desktop coordinates are in points, while modes are in pixels.
       node.x = static_cast<int>(bounds.origin.x);
       node.y = static_cast<int>(bounds.origin.y);
+      if (const auto stable_origin = layout_observer.baseline_origin(node.id)) {
+        node.x = stable_origin->first;
+        node.y = stable_origin->second;
+      }
       node.configured_mode = {
         .width = static_cast<int>(pixel_width),
         .height = static_cast<int>(pixel_height),

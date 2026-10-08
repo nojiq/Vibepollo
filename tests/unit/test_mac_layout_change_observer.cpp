@@ -66,3 +66,15 @@ TEST(MacLayoutMemory, KeepsMoveOfRemainingDisplayAfterRemoval) {
   EXPECT_FALSE(observer.observe(moved, start + 3s));
   EXPECT_TRUE(observer.observe(moved, start + 4s));
 }
+
+TEST(MacLayoutMemory, RetainsPhysicalAnchorOriginWhenRemoteDisplayIsRemoved) {
+  observer_t observer;
+  observer.topology_changed(start, initial);
+  observer.display_removed("msi", start + 1s);
+
+  const auto origin = observer.baseline_origin("surface");
+  ASSERT_TRUE(origin.has_value());
+  EXPECT_EQ(origin->first, 1920);
+  EXPECT_EQ(origin->second, 0);
+  EXPECT_FALSE(observer.baseline_origin("msi").has_value());
+}

@@ -4,6 +4,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 
@@ -26,6 +27,16 @@ namespace platf::macos_virtual_display {
       settle_until_ = now + std::chrono::seconds(2);
       if (baseline_) baseline_->erase(uuid);
       candidate_.reset();
+    }
+
+    // During a hotplug settle, CoreGraphics may move physical displays while
+    // the saved topology is being restored. Keep those coordinates as the
+    // stable baseline until an observed layout change is accepted.
+    std::optional<std::pair<int, int>> baseline_origin(std::string_view id) const {
+      if (!baseline_) return std::nullopt;
+      const auto it = baseline_->find(std::string {id});
+      if (it == baseline_->end()) return std::nullopt;
+      return std::pair {std::get<0>(it->second), std::get<1>(it->second)};
     }
 
     bool observe(const positions_t &positions, clock::time_point now) {
