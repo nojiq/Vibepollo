@@ -135,6 +135,7 @@ jobs:
             -Ithird-party/googletest/googletest/include -Ithird-party/googletest/googletest \
             tests/unit/test_remote_display_topology.cpp src/remote_display_topology.cpp \
             tests/unit/test_mac_layout_change_observer.cpp tests/unit/test_mac_remote_monitor_expiry.cpp \
+            tests/unit/test_rtsp_pending_policy.cpp src/rtsp_pending_policy.cpp \
             third-party/googletest/googletest/src/gtest-all.cc \
             third-party/googletest/googletest/src/gtest_main.cc \
             -o "${RUNNER_TEMP}/work-display-tests"
