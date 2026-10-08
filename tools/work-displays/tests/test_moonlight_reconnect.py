@@ -188,6 +188,40 @@ class RetryTests(unittest.TestCase):
 
 
 class ProcessAndControllerTests(unittest.TestCase):
+    def test_descendant_pids_walks_flatpak_process_tree(self):
+        with tempfile.TemporaryDirectory() as proc_root:
+            for pid, children in {"101": "102 103", "102": "104", "103": "", "104": ""}.items():
+                task_dir = pathlib.Path(proc_root) / pid / "task" / pid
+                task_dir.mkdir(parents=True)
+                (task_dir / "children").write_text(children)
+
+            self.assertEqual(module.descendant_pids(101, proc_root=proc_root), (102, 103, 104))
+
+    def test_owned_udp_socket_count_matches_process_descendants(self):
+        ss_output = """UNCONN 0 0 192.168.8.134:42613 0.0.0.0:* users:((\"moonlight\",pid=104,fd=40))
+UNCONN 0 0 192.168.8.134:32828 0.0.0.0:* users:((\"moonlight\",pid=999,fd=41))
+UNCONN 0 0 192.168.8.134:37128 0.0.0.0:* users:((\"moonlight\",pid=102,fd=42))
+"""
+
+        self.assertEqual(module.owned_udp_socket_count(ss_output, (101, 102, 104)), 2)
+
+    def test_owned_udp_socket_count_ignores_discovery_and_noncompany_rows(self):
+        ss_output = """UNCONN 0 0 192.168.8.134:5353 0.0.0.0:* users:((\"moonlight\",pid=101,fd=40))
+UNCONN 0 0 0.0.0.0:42000 0.0.0.0:* users:((\"moonlight\",pid=101,fd=41))
+UNCONN 0 0 127.0.0.1:42001 0.0.0.0:* users:((\"moonlight\",pid=101,fd=42))
+UNCONN 0 0 10.0.0.4:42002 0.0.0.0:* users:((\"moonlight\",pid=101,fd=43))
+UNCONN 0 0 192.168.8.134:42003 0.0.0.0:* users:((\"moonlight\",pid=101,fd=44))
+"""
+
+        self.assertEqual(
+            module.owned_udp_socket_count(
+                ss_output,
+                (101,),
+                networks=("192.168.8.0/24",),
+            ),
+            1,
+        )
+
     def test_owned_process_uses_its_process_group(self):
         process = mock.Mock(pid=1234)
 
@@ -328,6 +362,203 @@ class ProcessAndControllerTests(unittest.TestCase):
 
         self.assertFalse(controller.manual_hold)
         self.assertEqual(controller.next_retry_at, 10)
+
+    def test_lingering_failed_cli_is_restarted_after_startup_deadline(self):
+        class FakeProcess:
+            pid = 4242
+
+            def __init__(self):
+                self.waited = False
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout):
+                self.waited = True
+                return 0
+
+        class FakeController(module.ReconnectController):
+            def __init__(self):
+                super().__init__(
+                    module.Settings(startup_timeout_seconds=45),
+                    monotonic=lambda: self.now,
+                )
+                self.now = 45
+
+            def network_present(self):
+                return True
+
+        controller = FakeController()
+        process = FakeProcess()
+        controller.process = process
+        controller.process_started_at = 0
+        controller.active_profile = module.HostProfile(index=1, name="Mac", server_certificate="pinned")
+        controller.active_address = "192.168.8.150"
+        controller._owned_udp_socket_count = mock.Mock(return_value=0)
+
+        with mock.patch.object(module, "verify_pinned_host", return_value=True), mock.patch.object(
+            module.os, "killpg"
+        ) as killpg:
+            controller.step()
+
+        self.assertTrue(process.waited)
+        killpg.assert_called_once_with(4242, module.signal.SIGTERM)
+        self.assertIsNone(controller.process)
+        self.assertEqual(controller.next_retry_at, 50)
+
+    def test_healthy_paused_stream_is_kept_without_udp_rows(self):
+        class FakeProcess:
+            pid = 4243
+
+            def poll(self):
+                return None
+
+        class FakeController(module.ReconnectController):
+            def __init__(self):
+                super().__init__(module.Settings(), monotonic=lambda: self.now)
+                self.now = 100
+
+            def network_present(self):
+                return True
+
+        controller = FakeController()
+        controller.process = FakeProcess()
+        controller.process_started_at = 0
+        controller.active_profile = module.HostProfile(index=1, name="Mac", server_certificate="pinned")
+        controller.active_address = "192.168.8.150"
+        controller.stream_ready = True
+        controller._owned_udp_socket_count = mock.Mock(return_value=0)
+
+        with mock.patch.object(module, "verify_pinned_host", return_value=True):
+            controller.step()
+
+        self.assertIsNotNone(controller.process)
+        self.assertIsNone(controller.health_failed_since)
+
+    def test_host_loss_stops_ready_stream_only_after_health_grace(self):
+        class FakeProcess:
+            pid = 4244
+
+            def __init__(self):
+                self.waited = False
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout):
+                self.waited = True
+                return 0
+
+        class FakeController(module.ReconnectController):
+            def __init__(self):
+                super().__init__(module.Settings(health_absence_grace_seconds=5), monotonic=lambda: self.now)
+                self.now = 0
+
+            def network_present(self):
+                return True
+
+        controller = FakeController()
+        process = FakeProcess()
+        controller.process = process
+        controller.process_started_at = 0
+        controller.active_profile = module.HostProfile(index=1, name="Mac", server_certificate="pinned")
+        controller.active_address = "192.168.8.150"
+        controller.stream_ready = True
+        controller._owned_udp_socket_count = mock.Mock(return_value=0)
+
+        with mock.patch.object(module, "verify_pinned_host", return_value=False), mock.patch.object(
+            module.os, "killpg"
+        ) as killpg:
+            controller.step()
+            self.assertIsNotNone(controller.process)
+            controller.now = 4
+            controller.step()
+            self.assertIsNotNone(controller.process)
+            controller.now = 5
+            controller.step()
+
+        self.assertTrue(process.waited)
+        killpg.assert_called_once_with(4244, module.signal.SIGTERM)
+        self.assertIsNone(controller.process)
+
+    def test_ready_stream_dropout_restarts_after_udp_grace_even_when_host_is_healthy(self):
+        class FakeProcess:
+            pid = 4245
+
+            def __init__(self):
+                self.waited = False
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout):
+                self.waited = True
+                return 0
+
+        class FakeController(module.ReconnectController):
+            def __init__(self):
+                super().__init__(module.Settings(health_absence_grace_seconds=5), monotonic=lambda: self.now)
+                self.now = 0
+
+            def network_present(self):
+                return True
+
+        controller = FakeController()
+        process = FakeProcess()
+        controller.process = process
+        controller.process_started_at = 0
+        controller.active_profile = module.HostProfile(index=1, name="Mac", server_certificate="pinned")
+        controller.active_address = "192.168.8.150"
+        controller._owned_udp_socket_count = mock.Mock(side_effect=[3, 0, 0])
+
+        with mock.patch.object(module, "verify_pinned_host", return_value=True), mock.patch.object(
+            module.os, "killpg"
+        ) as killpg:
+            controller.step()
+            self.assertTrue(controller.stream_ready)
+            controller.now = 1
+            controller.step()
+            self.assertIsNotNone(controller.process)
+            controller.now = 6
+            controller.step()
+
+        self.assertTrue(process.waited)
+        killpg.assert_called_once_with(4245, module.signal.SIGTERM)
+        self.assertIsNone(controller.process)
+        self.assertEqual(controller.next_retry_at, 11)
+
+    def test_unknown_udp_probe_does_not_false_kill_startup_or_ready_stream(self):
+        class FakeProcess:
+            pid = 4246
+
+            def poll(self):
+                return None
+
+        class FakeController(module.ReconnectController):
+            def __init__(self):
+                super().__init__(module.Settings(startup_timeout_seconds=45), monotonic=lambda: self.now)
+                self.now = 100
+
+            def network_present(self):
+                return True
+
+        controller = FakeController()
+        controller.process = FakeProcess()
+        controller.process_started_at = 0
+        controller.active_profile = module.HostProfile(index=1, name="Mac", server_certificate="pinned")
+        controller.active_address = "192.168.8.150"
+        controller._owned_udp_socket_count = mock.Mock(return_value=None)
+
+        with mock.patch.object(module, "verify_pinned_host", return_value=True):
+            controller.step()
+            self.assertIsNotNone(controller.process)
+            self.assertFalse(controller.stream_ready)
+            controller.stream_ready = True
+            controller.now = 200
+            controller.step()
+
+        self.assertIsNotNone(controller.process)
+        self.assertIsNone(controller.udp_absent_since)
 
 
 if __name__ == "__main__":

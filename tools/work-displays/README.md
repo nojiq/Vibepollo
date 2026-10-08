@@ -21,6 +21,14 @@ The helper:
 - uses an advisory lock and `/proc` scan to avoid starting a second stream;
 - starts Moonlight in its own process group, so disconnect cleanup cannot kill
   unrelated desktop processes;
+- watches at least two owned, company-bound descendant UDP sockets during
+  startup and restarts it if the v6.2.0 CLI remains open behind a failed-stream
+  error dialog; DNS, mDNS, SSDP, wildcard, loopback, and off-subnet rows do not
+  count;
+- verifies the pinned Sunshine certificate while connected and stops/retries
+  after 5 seconds of host loss; after startup, a known zero-socket session is
+  restarted after the same 5-second grace, while an unavailable `ss` probe is
+  treated as unknown and never kills a healthy stream;
 - treats a clean Moonlight exit as a manual quit and waits for a network
   transition or an explicit service restart before reconnecting; clean exits
   during the first 15 seconds are treated as startup failures and retried.
@@ -28,6 +36,12 @@ The helper:
 It never writes `Moonlight.conf`, changes pairing, or modifies Moonlight's
 video settings. The stream flags are the existing Surface profile:
 H.264, hardware decode, 2160x1440, 30 FPS, 12 Mbps, fullscreen.
+
+Moonlight 6.2.0 transitions a failed CLI launch to its GUI error dialog; the
+dialog closes the Qt application only when a user closes it. The 45-second
+startup watchdog covers a lost host or app-search failure when the dialog is
+left open. See the [v6.2.0 launcher source](https://github.com/moonlight-stream/moonlight-qt/blob/v6.2.0/app/cli/startstream.cpp)
+and [CLI segue](https://github.com/moonlight-stream/moonlight-qt/blob/v6.2.0/app/gui/CliStartStreamSegue.qml).
 
 ## Install on the Surface
 
@@ -53,6 +67,10 @@ MOONLIGHT_TRUSTED_SSIDS=JKS_2.4G,JKS_5G
 MOONLIGHT_IDLE_DISCONNECT_SECONDS=30
 # Clean exits before this age are retried instead of treated as manual quit.
 MOONLIGHT_STARTUP_GRACE_SECONDS=15
+# Kill/retry a live Moonlight GUI that never creates a streaming UDP session.
+MOONLIGHT_STARTUP_TIMEOUT_SECONDS=45
+# Host certificate health must fail continuously for this long after startup.
+MOONLIGHT_HEALTH_ABSENCE_GRACE_SECONDS=5
 ```
 
 Disable the old one-shot GUI autostart before enabling the service. Keep a

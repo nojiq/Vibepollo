@@ -25,6 +25,10 @@ import time
 from typing import Iterable
 
 
+MIN_STREAM_UDP_SOCKETS = 2
+DISCOVERY_UDP_PORTS = frozenset({53, 1900, 5353})
+
+
 def parse_tls_ports(raw: str | None, default: tuple[int, ...] = (47984, 47990)) -> tuple[int, ...]:
     """Parse literal decimal TLS ports from the environment."""
 
@@ -70,6 +74,8 @@ class Settings:
     backoff_base_seconds: int = 5
     backoff_max_seconds: int = 120
     startup_grace_seconds: float = 15.0
+    startup_timeout_seconds: float = 45.0
+    health_absence_grace_seconds: float = 5.0
     tls_ports: tuple[int, ...] = (47984, 47990)
     command_timeout_seconds: float = 20.0
 
@@ -112,6 +118,16 @@ class Settings:
             backoff_max_seconds=max(1, integer("MOONLIGHT_BACKOFF_MAX_SECONDS", cls.backoff_max_seconds)),
             startup_grace_seconds=max(
                 1.0, number("MOONLIGHT_STARTUP_GRACE_SECONDS", cls.startup_grace_seconds)
+            ),
+            startup_timeout_seconds=max(
+                1.0, number("MOONLIGHT_STARTUP_TIMEOUT_SECONDS", cls.startup_timeout_seconds)
+            ),
+            health_absence_grace_seconds=max(
+                1.0,
+                number(
+                    "MOONLIGHT_HEALTH_ABSENCE_GRACE_SECONDS",
+                    cls.health_absence_grace_seconds,
+                ),
             ),
             tls_ports=parse_tls_ports(os.environ.get("MOONLIGHT_TLS_PORTS"), cls.tls_ports),
             command_timeout_seconds=max(
@@ -397,6 +413,82 @@ def existing_stream_pids(*, proc_root: str = "/proc", current_pid: int | None = 
     return tuple(sorted(found))
 
 
+def descendant_pids(pid: int, *, proc_root: str = "/proc") -> tuple[int, ...]:
+    """Return descendant process IDs visible through Linux procfs."""
+
+    pending = [pid]
+    found: set[int] = set()
+    while pending:
+        parent = pending.pop()
+        if parent in found:
+            continue
+        found.add(parent)
+        children_path = Path(proc_root) / str(parent) / "task" / str(parent) / "children"
+        try:
+            children = tuple(int(value) for value in children_path.read_text().split())
+        except (OSError, ValueError):
+            continue
+        pending.extend(child for child in children if child not in found)
+    found.discard(pid)
+    return tuple(sorted(found))
+
+
+def _local_udp_endpoint(
+    endpoint: str,
+) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int] | None:
+    """Parse the numeric local endpoint column emitted by ``ss -n``."""
+
+    if endpoint.startswith("["):
+        close = endpoint.rfind("]:")
+        if close < 0:
+            return None
+        host = endpoint[1:close]
+        port_text = endpoint[close + 2 :]
+    else:
+        host, separator, port_text = endpoint.rpartition(":")
+        if not separator:
+            return None
+    host = host.split("%", 1)[0]
+    try:
+        address = ipaddress.ip_address(host)
+        port = int(port_text)
+    except ValueError:
+        return None
+    return address, port
+
+
+def owned_udp_socket_count(
+    ss_output: str,
+    pids: Iterable[int],
+    *,
+    networks: Iterable[str] | None = None,
+) -> int:
+    """Count owned, routable UDP rows, excluding common discovery sockets."""
+
+    owned = {pid for pid in pids if isinstance(pid, int) and pid > 0}
+    if not owned:
+        return 0
+    allowed = tuple(ipaddress.ip_network(network, strict=False) for network in networks or ())
+    count = 0
+    for line in ss_output.splitlines():
+        line_pids = {int(value) for value in re.findall(r"pid=(\d+)", line)}
+        if not line_pids & owned:
+            continue
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        endpoint = _local_udp_endpoint(fields[3])
+        if endpoint is None:
+            continue
+        address, port = endpoint
+        if port in DISCOVERY_UDP_PORTS or address.is_unspecified or address.is_loopback:
+            continue
+        if allowed and not any(address in network for network in allowed):
+            continue
+        count += 1
+    return count
+
+
 class ReconnectController:
     """Small state machine for presence, retry, and stream ownership."""
 
@@ -418,6 +510,11 @@ class ReconnectController:
         self.proc_root = proc_root
         self.process = None
         self.process_started_at: float | None = None
+        self.active_profile: HostProfile | None = None
+        self.active_address: str | None = None
+        self.stream_ready = False
+        self.udp_absent_since: float | None = None
+        self.health_failed_since: float | None = None
         self.absent_since: float | None = None
         self.manual_hold = False
         self.retry_attempt = 0
@@ -474,7 +571,10 @@ class ReconnectController:
             self.next_retry_at = now
             self.logger.info("company network present; reconnecting")
 
-        if self.process is not None or self.manual_hold or now < self.next_retry_at:
+        if self.process is not None:
+            self._check_stream_health(now)
+            return
+        if self.manual_hold or now < self.next_retry_at:
             return
         if existing_stream_pids(proc_root=self.proc_root):
             self.manual_hold = True
@@ -499,15 +599,17 @@ class ReconnectController:
         exit_code = self.process.poll()
         if exit_code is None:
             return
-        self.process = None
         started_at = self.process_started_at
-        self.process_started_at = None
+        self._clear_process_state()
         if exit_code == 0 and present and (
             started_at is None or now - started_at >= self.settings.startup_grace_seconds
         ):
             self.manual_hold = True
             self.logger.info("Moonlight exited cleanly; holding until network transition or service restart")
             return
+        self._schedule_retry(now, "Moonlight exited with status %s", exit_code)
+
+    def _schedule_retry(self, now: float, message: str, *message_args: object) -> None:
         self.retry_attempt += 1
         delay = backoff_seconds(
             self.retry_attempt - 1,
@@ -515,13 +617,101 @@ class ReconnectController:
             maximum=self.settings.backoff_max_seconds,
         )
         self.next_retry_at = now + delay
-        self.logger.info("Moonlight exited with status %s; retrying in %ss", exit_code, delay)
+        rendered = message % message_args if message_args else message
+        self.logger.info("%s; retrying in %ss", rendered, delay)
+
+    def _clear_process_state(self) -> None:
+        self.process = None
+        self.process_started_at = None
+        self.active_profile = None
+        self.active_address = None
+        self.stream_ready = False
+        self.udp_absent_since = None
+        self.health_failed_since = None
 
     def _run(self, command: list[str], *, timeout: float):
         try:
             return self.command_runner(command, capture_output=True, text=True, timeout=timeout, check=False)
         except (OSError, subprocess.SubprocessError):
             return None
+
+    def _owned_udp_socket_count(self) -> int | None:
+        """Return owned Moonlight UDP rows, or None when ``ss`` is unavailable."""
+
+        process_id = getattr(self.process, "pid", None)
+        if not isinstance(process_id, int) or process_id <= 0:
+            return None
+        result = self._run(["ss", "-H", "-u", "-a", "-n", "-p"], timeout=2.0)
+        if result is None or result.returncode != 0:
+            return None
+        pids = (process_id, *descendant_pids(process_id, proc_root=self.proc_root))
+        return owned_udp_socket_count(result.stdout, pids, networks=self.settings.company_networks)
+
+    def _check_stream_health(self, now: float) -> None:
+        """Recover a stuck or disconnected stream that left its GUI process alive."""
+
+        if self.process is None:
+            return
+
+        socket_count = self._owned_udp_socket_count()
+        if not self.stream_ready and socket_count is not None and socket_count >= MIN_STREAM_UDP_SOCKETS:
+            self.stream_ready = True
+            self.logger.info("Moonlight stream ready (%s owned UDP sockets)", socket_count)
+
+        if (
+            not self.stream_ready
+            and socket_count is not None
+            and socket_count < MIN_STREAM_UDP_SOCKETS
+            and self.process_started_at is not None
+            and now - self.process_started_at >= self.settings.startup_timeout_seconds
+        ):
+            self.logger.info(
+                "Moonlight stream produced no UDP session within %.0fs; restarting owned process",
+                self.settings.startup_timeout_seconds,
+            )
+            self.stop_owned_stream()
+            self._schedule_retry(now, "Moonlight startup watchdog fired")
+            return
+
+        if self.stream_ready:
+            if socket_count is None:
+                self.udp_absent_since = None
+            elif socket_count == 0:
+                if self.udp_absent_since is None:
+                    self.udp_absent_since = now
+                    self.logger.info("owned Moonlight UDP session disappeared; waiting before stopping")
+                elif now - self.udp_absent_since >= self.settings.health_absence_grace_seconds:
+                    self.logger.info(
+                        "owned Moonlight UDP session absent for %.0fs; restarting stream",
+                        now - self.udp_absent_since,
+                    )
+                    self.stop_owned_stream()
+                    self._schedule_retry(now, "Moonlight UDP session watchdog fired")
+                    return
+            else:
+                self.udp_absent_since = None
+
+        if self.active_profile is None or self.active_address is None:
+            return
+        if verify_pinned_host(
+            self.active_address,
+            self.active_profile.server_certificate,
+            ports=self.settings.tls_ports,
+        ):
+            self.health_failed_since = None
+            return
+        if self.health_failed_since is None:
+            self.health_failed_since = now
+            self.logger.info("paired host health check failed; waiting before stopping stream")
+            return
+        if now - self.health_failed_since < self.settings.health_absence_grace_seconds:
+            return
+        self.logger.info(
+            "paired host unavailable for %.0fs; stopping owned stream",
+            now - self.health_failed_since,
+        )
+        self.stop_owned_stream()
+        self._schedule_retry(now, "Moonlight host health watchdog fired")
 
     def _profile(self) -> HostProfile | None:
         configured_path = Path(os.path.expanduser(self.settings.config_path))
@@ -600,6 +790,11 @@ class ReconnectController:
             except OSError:
                 return False
             self.process_started_at = self.monotonic()
+            self.active_profile = profile
+            self.active_address = address
+            self.stream_ready = False
+            self.udp_absent_since = None
+            self.health_failed_since = None
             self.logger.info("started %s on paired host %s", app, address)
             return True
         return False
@@ -608,8 +803,7 @@ class ReconnectController:
         if self.process is None:
             return
         process = self.process
-        self.process = None
-        self.process_started_at = None
+        self._clear_process_state()
         try:
             self._signal_owned_process(process, signal.SIGTERM, "terminate")
             process.wait(timeout=5)
