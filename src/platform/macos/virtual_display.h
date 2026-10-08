@@ -72,6 +72,9 @@ namespace platf::macos_virtual_display {
   /// The active displays other than Remote Monitor ones, which the topology arranges them around.
   std::vector<remote_display_topology::node_t> remote_baseline();
 
+  /// The baseline used for composition, retaining stable physical origins across hotplug drift.
+  std::vector<remote_display_topology::node_t> remote_baseline_for_composition();
+
   /// Stable user rearrangements, excluding display creation/removal and our own moves.
   std::optional<std::vector<remote_display_topology::node_t>> remote_layout_changes();
 

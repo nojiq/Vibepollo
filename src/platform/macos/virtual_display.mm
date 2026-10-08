@@ -739,6 +739,11 @@ namespace platf::macos_virtual_display {
     std::mutex remote_mutex;  ///< Held while displays are created, which takes seconds.
     std::map<std::string, remote_display_t> remote_displays;  ///< By client UUID.
     layout_change_observer_t layout_observer;  ///< Guarded by remote_mutex.
+    std::map<std::string, std::pair<int, int>> stable_physical_origins;  ///< Guarded by remote_mutex.
+
+    std::vector<remote_display_topology::node_t> remote_baseline_unlocked();
+    void seed_physical_origins(const std::vector<remote_display_topology::node_t> &baseline);
+    void update_physical_origins(const std::vector<remote_display_topology::node_t> &baseline);
 
     // The displays' IDs, for lookups from input and capture that mustn't wait on remote_mutex.
     std::mutex remote_ids_mutex;
@@ -821,6 +826,7 @@ namespace platf::macos_virtual_display {
 
   bool remote_create_or_reclaim(const std::string &client_uuid, const std::string &client_label, const remote_display_topology::mode_t &mode) {
     std::lock_guard lock {remote_mutex};
+    seed_physical_origins(remote_baseline_unlocked());
     auto &remote = remote_displays[client_uuid];
     if (remote.display && is_active(remote.display->id) && remote.mode.width == mode.width && remote.mode.height == mode.height && remote.mode.refresh_hz == mode.refresh_hz && remote.mode.hdr == mode.hdr) {
       return true;
@@ -847,6 +853,7 @@ namespace platf::macos_virtual_display {
 
   bool remote_apply_composed_topology(const std::vector<remote_display_topology::node_t> &composed) {
     std::lock_guard lock {remote_mutex};
+    seed_physical_origins(remote_baseline_unlocked());
     CGDisplayConfigRef config;
     if (CGBeginDisplayConfiguration(&config) != kCGErrorSuccess) {
       return false;
@@ -855,9 +862,6 @@ namespace platf::macos_virtual_display {
     struct applied_display_t {
       std::string id;
       CGDirectDisplayID display_id;
-      bool physical;
-      int requested_x;
-      int requested_y;
     };
     std::vector<applied_display_t> applied_displays;
     for (const auto &node : composed) {
@@ -869,7 +873,7 @@ namespace platf::macos_virtual_display {
       }
       if (node.active && id != kCGNullDirectDisplay && is_active(id)) {
         CGConfigureDisplayOrigin(config, id, node.x, node.y);
-        applied_displays.push_back({node.id, id, node.physical, node.x, node.y});
+        applied_displays.push_back({node.id, id});
       }
     }
     // Like the game's virtual display, the arrangement lasts only while Vibepollo runs.
@@ -877,12 +881,7 @@ namespace platf::macos_virtual_display {
     if (applied) {
       for (const auto &display : applied_displays) {
         const auto bounds = CGDisplayBounds(display.display_id);
-        // Physical origins come from the stable observer baseline. macOS may
-        // move them during a virtual-display hotplug; accepting that shift as
-        // a new baseline would move saved remote offsets on reconnect.
-        const int x = display.physical ? display.requested_x : static_cast<int>(bounds.origin.x);
-        const int y = display.physical ? display.requested_y : static_cast<int>(bounds.origin.y);
-        expected[display.id] = {x, y, static_cast<int>(bounds.size.width), static_cast<int>(bounds.size.height)};
+        expected[display.id] = {static_cast<int>(bounds.origin.x), static_cast<int>(bounds.origin.y), static_cast<int>(bounds.size.width), static_cast<int>(bounds.size.height)};
       }
       layout_observer.topology_changed(std::chrono::steady_clock::now(), std::move(expected));
     }
@@ -906,43 +905,90 @@ namespace platf::macos_virtual_display {
 
   bool remote_remove_owned_display(const std::string &client_uuid) {
     std::lock_guard lock {remote_mutex};
-    layout_observer.display_removed(client_uuid, std::chrono::steady_clock::now());
+    seed_physical_origins(remote_baseline_unlocked());
+    const auto now = std::chrono::steady_clock::now();
+    layout_observer.display_removed(client_uuid, now);
     remote_displays.erase(client_uuid);
     publish_remote_ids();
+    // The physical topology may move while the virtual output disappears.
+    // Re-seed the observer from a later raw snapshot; the stable compose cache
+    // above remains unchanged through that hotplug.
+    layout_observer.topology_changed(now);
     return true;
   }
 
+  namespace {
+    std::vector<remote_display_topology::node_t> remote_baseline_unlocked() {
+      std::vector<remote_display_topology::node_t> baseline;
+      for (const auto id : display_list(CGGetActiveDisplayList)) {
+        if (is_remote_display(id)) {
+          continue;
+        }
+        const CGRect bounds = CGDisplayBounds(id);
+        const auto [pixel_width, pixel_height] = current_pixels(id);
+        remote_display_topology::node_t node;
+        node.id = physical_identity(id);
+        node.device_id = std::to_string(id);
+        node.label = display_label(id);
+        node.preexisting = true;
+        node.physical = id != current_id.load();
+        node.active = true;
+        node.primary = CGDisplayIsMain(id);
+        // Desktop coordinates are in points, while modes are in pixels.
+        node.x = static_cast<int>(bounds.origin.x);
+        node.y = static_cast<int>(bounds.origin.y);
+        node.configured_mode = {
+          .width = static_cast<int>(pixel_width),
+          .height = static_cast<int>(pixel_height),
+          .refresh_hz = current_refresh_hz(id),
+        };
+        node.layout_width = static_cast<int>(bounds.size.width);
+        node.layout_height = static_cast<int>(bounds.size.height);
+        baseline.push_back(std::move(node));
+      }
+      return baseline;
+    }
+
+    void seed_physical_origins(const std::vector<remote_display_topology::node_t> &baseline) {
+      std::vector<std::string> current_ids;
+      for (const auto &node : baseline) {
+        if (!node.physical || !node.active || node.id.empty()) continue;
+        current_ids.push_back(node.id);
+        stable_physical_origins.try_emplace(node.id, node.x, node.y);
+      }
+      std::erase_if(stable_physical_origins, [&](const auto &entry) {
+        return std::find(current_ids.begin(), current_ids.end(), entry.first) == current_ids.end();
+      });
+    }
+
+    void update_physical_origins(const std::vector<remote_display_topology::node_t> &baseline) {
+      std::vector<std::string> current_ids;
+      for (const auto &node : baseline) {
+        if (!node.physical || !node.active || node.id.empty()) continue;
+        current_ids.push_back(node.id);
+        stable_physical_origins[node.id] = {node.x, node.y};
+      }
+      std::erase_if(stable_physical_origins, [&](const auto &entry) {
+        return std::find(current_ids.begin(), current_ids.end(), entry.first) == current_ids.end();
+      });
+    }
+  }  // namespace
+
   std::vector<remote_display_topology::node_t> remote_baseline() {
-    std::vector<remote_display_topology::node_t> baseline;
-    for (const auto id : display_list(CGGetActiveDisplayList)) {
-      if (is_remote_display(id)) {
-        continue;
+    std::lock_guard lock {remote_mutex};
+    return remote_baseline_unlocked();
+  }
+
+  std::vector<remote_display_topology::node_t> remote_baseline_for_composition() {
+    std::lock_guard lock {remote_mutex};
+    auto baseline = remote_baseline_unlocked();
+    seed_physical_origins(baseline);
+    for (auto &node : baseline) {
+      if (!node.physical) continue;
+      if (const auto stable_origin = stable_physical_origins.find(node.id); stable_origin != stable_physical_origins.end()) {
+        node.x = stable_origin->second.first;
+        node.y = stable_origin->second.second;
       }
-      const CGRect bounds = CGDisplayBounds(id);
-      const auto [pixel_width, pixel_height] = current_pixels(id);
-      remote_display_topology::node_t node;
-      node.id = physical_identity(id);
-      node.device_id = std::to_string(id);
-      node.label = display_label(id);
-      node.preexisting = true;
-      node.physical = id != current_id.load();
-      node.active = true;
-      node.primary = CGDisplayIsMain(id);
-      // Desktop coordinates are in points, while modes are in pixels.
-      node.x = static_cast<int>(bounds.origin.x);
-      node.y = static_cast<int>(bounds.origin.y);
-      if (const auto stable_origin = layout_observer.baseline_origin(node.id)) {
-        node.x = stable_origin->first;
-        node.y = stable_origin->second;
-      }
-      node.configured_mode = {
-        .width = static_cast<int>(pixel_width),
-        .height = static_cast<int>(pixel_height),
-        .refresh_hz = current_refresh_hz(id),
-      };
-      node.layout_width = static_cast<int>(bounds.size.width);
-      node.layout_height = static_cast<int>(bounds.size.height);
-      baseline.push_back(std::move(node));
     }
     return baseline;
   }
@@ -950,8 +996,7 @@ namespace platf::macos_virtual_display {
   std::optional<std::vector<remote_display_topology::node_t>> remote_layout_changes() {
     @autoreleasepool {
       std::lock_guard lock {remote_mutex};
-      if (remote_displays.empty()) return std::nullopt;
-      auto nodes = remote_baseline();
+      auto nodes = remote_baseline_unlocked();
       for (const auto &[uuid, remote] : remote_displays) {
         if (!remote.display || !is_active(remote.display->id)) continue;
         const auto bounds = CGDisplayBounds(remote.display->id);
@@ -968,7 +1013,12 @@ namespace platf::macos_virtual_display {
       for (const auto &node : nodes) {
         positions[node.id] = {node.x, node.y, node.layout_width.value_or(0), node.layout_height.value_or(0)};
       }
-      if (!layout_observer.observe(positions, std::chrono::steady_clock::now())) return std::nullopt;
+      std::vector<std::string> physical_ids;
+      for (const auto &node : nodes) {
+        if (node.physical) physical_ids.push_back(node.id);
+      }
+      if (!layout_observer.observe(positions, std::chrono::steady_clock::now(), physical_ids)) return std::nullopt;
+      if (layout_observer.last_change_included_physical()) update_physical_origins(nodes);
       return nodes;
     }
   }

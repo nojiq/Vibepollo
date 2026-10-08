@@ -67,14 +67,39 @@ TEST(MacLayoutMemory, KeepsMoveOfRemainingDisplayAfterRemoval) {
   EXPECT_TRUE(observer.observe(moved, start + 4s));
 }
 
-TEST(MacLayoutMemory, RetainsPhysicalAnchorOriginWhenRemoteDisplayIsRemoved) {
+TEST(MacLayoutMemory, ReseedsRawPositionsAfterRemovalBeforeSavingMoves) {
   observer_t observer;
   observer.topology_changed(start, initial);
   observer.display_removed("msi", start + 1s);
 
-  const auto origin = observer.baseline_origin("surface");
-  ASSERT_TRUE(origin.has_value());
-  EXPECT_EQ(origin->first, 1920);
-  EXPECT_EQ(origin->second, 0);
-  EXPECT_FALSE(observer.baseline_origin("msi").has_value());
+  auto shifted = initial;
+  shifted.erase("msi");
+  shifted["surface"] = {0, 0, 2160, 1440};
+  observer.topology_changed(start + 1s);
+  EXPECT_FALSE(observer.observe(shifted, start + 3s));
+
+  shifted["surface"] = {100, 200, 2160, 1440};
+  EXPECT_FALSE(observer.observe(shifted, start + 4s));
+  EXPECT_TRUE(observer.observe(shifted, start + 5s));
+}
+
+TEST(MacLayoutMemory, ReportsWhetherAcceptedMoveIncludedPhysicalOutput) {
+  observer_t observer;
+  const observer_t::positions_t initial {
+    {"physical", {0, 0, 1920, 1080}},
+    {"remote", {1920, 0, 2160, 1440}},
+  };
+  observer.topology_changed(start, initial);
+
+  auto remote_move = initial;
+  remote_move["remote"] = {100, 200, 2160, 1440};
+  EXPECT_FALSE(observer.observe(remote_move, start + 3s, {"physical"}));
+  EXPECT_TRUE(observer.observe(remote_move, start + 4s, {"physical"}));
+  EXPECT_FALSE(observer.last_change_included_physical());
+
+  auto physical_move = remote_move;
+  physical_move["physical"] = {-1920, 40, 1920, 1080};
+  EXPECT_FALSE(observer.observe(physical_move, start + 5s, {"physical"}));
+  EXPECT_TRUE(observer.observe(physical_move, start + 6s, {"physical"}));
+  EXPECT_TRUE(observer.last_change_included_physical());
 }

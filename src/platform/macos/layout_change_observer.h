@@ -1,12 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace platf::macos_virtual_display {
   // CoreGraphics also reports moves caused by reconnecting displays. Seed a
@@ -21,25 +22,33 @@ namespace platf::macos_virtual_display {
       settle_until_ = now + std::chrono::seconds(2);
       baseline_ = std::move(expected);
       candidate_.reset();
+      last_change_included_physical_ = false;
     }
 
     void display_removed(const std::string &uuid, clock::time_point now) {
       settle_until_ = now + std::chrono::seconds(2);
       if (baseline_) baseline_->erase(uuid);
       candidate_.reset();
-    }
-
-    // During a hotplug settle, CoreGraphics may move physical displays while
-    // the saved topology is being restored. Keep those coordinates as the
-    // stable baseline until an observed layout change is accepted.
-    std::optional<std::pair<int, int>> baseline_origin(std::string_view id) const {
-      if (!baseline_) return std::nullopt;
-      const auto it = baseline_->find(std::string {id});
-      if (it == baseline_->end()) return std::nullopt;
-      return std::pair {std::get<0>(it->second), std::get<1>(it->second)};
+      last_change_included_physical_ = false;
     }
 
     bool observe(const positions_t &positions, clock::time_point now) {
+      return observe_impl(positions, now, nullptr);
+    }
+
+    bool observe(const positions_t &positions, clock::time_point now, const std::vector<std::string> &physical_ids) {
+      return observe_impl(positions, now, &physical_ids);
+    }
+
+    bool last_change_included_physical() const { return last_change_included_physical_; }
+
+  private:
+    static bool contains(const std::vector<std::string> *ids, const std::string &id) {
+      return !ids || std::find(ids->begin(), ids->end(), id) != ids->end();
+    }
+
+    bool observe_impl(const positions_t &positions, clock::time_point now, const std::vector<std::string> *physical_ids) {
+      last_change_included_physical_ = false;
       if (now < settle_until_) return false;
       if (!baseline_) {
         baseline_ = positions;
@@ -55,15 +64,28 @@ namespace platf::macos_virtual_display {
         return false;
       }
       if (now - candidate_since_ < std::chrono::milliseconds(500)) return false;
+      if (physical_ids) {
+        last_change_included_physical_ = std::any_of(
+          positions.begin(),
+          positions.end(),
+          [&](const auto &entry) {
+            if (!contains(physical_ids, entry.first)) return false;
+            const auto previous = baseline_->find(entry.first);
+            return previous == baseline_->end() || previous->second != entry.second;
+          }
+        );
+      } else {
+        last_change_included_physical_ = true;
+      }
       baseline_ = positions;
       candidate_.reset();
       return true;
     }
 
-  private:
     clock::time_point settle_until_ {};
     clock::time_point candidate_since_ {};
     std::optional<positions_t> baseline_;
     std::optional<positions_t> candidate_;
+    bool last_change_included_physical_ = false;
   };
 }  // namespace platf::macos_virtual_display

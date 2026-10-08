@@ -741,7 +741,7 @@ namespace nvhttp {
     platf::macos_virtual_display::remote_monitor_expiry_t mac_remote_expiry;
 
     void refresh_remote_monitor_baseline(bool) {
-      remote_display_topology::instance().set_physical_baseline(platf::macos_virtual_display::remote_baseline());
+      remote_display_topology::instance().set_physical_baseline(platf::macos_virtual_display::remote_baseline_for_composition());
     }
 
     void register_remote_monitor_runtime() {
@@ -6774,9 +6774,10 @@ namespace nvhttp {
           }
         }
         if (auto observed = platf::macos_virtual_display::remote_layout_changes()) {
-          std::vector<remote_display_topology::node_t> physical;
-          std::copy_if(observed->begin(), observed->end(), std::back_inserter(physical), [](const auto &node) { return node.physical; });
-          remote_display_topology::instance().set_physical_baseline(std::move(physical));
+          // The observer reports raw CoreGraphics positions so it can detect
+          // settled manual moves. Composition uses the cached physical
+          // origins, which must remain stable across macOS hotplug shifts.
+          remote_display_topology::instance().set_physical_baseline(platf::macos_virtual_display::remote_baseline_for_composition());
           if (auto layout = remote_display_topology::instance().remember_positions(*observed)) {
             {
               std::lock_guard lock {client_mutex};
