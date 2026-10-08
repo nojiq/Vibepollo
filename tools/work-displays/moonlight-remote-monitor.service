@@ -1,0 +1,16 @@
+[Unit]
+Description=Reconnect the paired Vibepollo Remote Monitor on the company LAN
+Wants=network-online.target
+After=network-online.target graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/moonlight-remote-monitor
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+EnvironmentFile=-%h/.config/vibepollo/moonlight-reconnect.env
+
+[Install]
+WantedBy=graphical-session.target
