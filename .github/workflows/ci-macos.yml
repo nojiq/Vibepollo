@@ -53,7 +53,7 @@ env:
   BRANCH: ${{ github.head_ref || github.ref_name }}
   BUILD_VERSION: ${{ inputs.release_version || '2.0.0' }}
   COMMIT: ${{ inputs.release_commit || github.sha }}
-  MACOSX_DEPLOYMENT_TARGET: 15.0
+  MACOSX_DEPLOYMENT_TARGET: '15.0'
   OPENSSL_VERSION: 3.6.5
   OPENSSL_SHA256: a2157c2830efdec3788939b00c9b0638306d3f0bbb76dc4832ee503bb397df98
 
@@ -169,6 +169,7 @@ jobs:
           echo "::remove-matcher owner=gcc::"
 
       - name: Package DMG
+        id: package
         env:
           APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
           MATRIX_NAME: ${{ matrix.name }}
@@ -216,7 +217,14 @@ jobs:
           echo "${MATRIX_NAME} requires macOS ${min_macos} or later"
           echo "- ${MATRIX_NAME}: requires macOS ${min_macos} or later" >> "${GITHUB_STEP_SUMMARY}"
           # A bundled library built for a newer macOS raises the whole app's minimum.
-          if [[ "$(printf '%s\n' "${min_macos}" "${MACOSX_DEPLOYMENT_TARGET}" | sort -V | tail -1)" != "${MACOSX_DEPLOYMENT_TARGET}" ]]; then
+          if ! python3 - "${min_macos}" "${MACOSX_DEPLOYMENT_TARGET}" <<'PY'
+          import sys
+          def version(value):
+              parts = tuple(map(int, value.split('.')))
+              return parts + (0,) * max(0, 3 - len(parts))
+          sys.exit(0 if version(sys.argv[1]) <= version(sys.argv[2]) else 1)
+          PY
+          then
             echo "::error::${MATRIX_NAME} requires macOS ${min_macos}, newer than the ${MACOSX_DEPLOYMENT_TARGET} deployment target"
             hdiutil detach "${mnt}" -quiet || true
             exit 1
@@ -273,6 +281,7 @@ jobs:
           fi
 
       - name: Set artifact prefix
+        if: always() && steps.package.outcome == 'success'
         id: artifact_prefix
         env:
           INPUTS_PUBLISH_RELEASE: ${{ inputs.publish_release }}
@@ -284,6 +293,7 @@ jobs:
           fi
 
       - name: Upload Artifacts
+        if: always() && steps.package.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ${{ steps.artifact_prefix.outputs.prefix }}-${{ matrix.name }}
