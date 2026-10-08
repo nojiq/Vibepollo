@@ -98,3 +98,22 @@ TEST(RtspPendingPolicy, DisconnectCleanupDoesNotSelectPostRemovalInputGeneration
   EXPECT_FALSE(remembered_generations.contains(7));
   EXPECT_TRUE(remembered_generations.contains(8));
 }
+
+TEST(RtspPendingPolicy, TeardownReservationBlocksExpiryUntilJoinCompletes) {
+  std::atomic_uint pending_teardowns {};
+  EXPECT_TRUE(rtsp_stream::pending_policy::teardown_cleanup_allowed(0, pending_teardowns.load()));
+
+  {
+    rtsp_stream::pending_policy::teardown_reservation_t reservation {pending_teardowns};
+    EXPECT_EQ(pending_teardowns.load(), 1u);
+    EXPECT_FALSE(rtsp_stream::pending_policy::teardown_cleanup_allowed(0, pending_teardowns.load()));
+
+    auto moved = std::move(reservation);
+    EXPECT_EQ(pending_teardowns.load(), 1u);
+    EXPECT_FALSE(rtsp_stream::pending_policy::teardown_cleanup_allowed(0, pending_teardowns.load()));
+  }
+
+  EXPECT_EQ(pending_teardowns.load(), 0u);
+  EXPECT_TRUE(rtsp_stream::pending_policy::teardown_cleanup_allowed(0, pending_teardowns.load()));
+  EXPECT_FALSE(rtsp_stream::pending_policy::teardown_cleanup_allowed(1, 0));
+}

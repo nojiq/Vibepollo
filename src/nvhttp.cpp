@@ -6749,18 +6749,28 @@ namespace nvhttp {
         // A lost transport retains its display briefly for Resume. Expire only
         // that owner, never a peer or a replacement generation.
         if (!rtsp_stream::has_pending_launch_or_startup() &&
-            stream::session::teardown_sessions.load(std::memory_order_acquire) == 0) {
+            rtsp_stream::pending_policy::teardown_cleanup_allowed(
+              stream::session::teardown_sessions.load(std::memory_order_acquire),
+              rtsp_stream::pending_teardown_count()
+            )) {
           std::vector<platf::macos_virtual_display::remote_monitor_expiry_t::expired_entry_t> expired;
           {
             std::lock_guard lock {mac_remote_expiry_mutex};
             expired = mac_remote_expiry.expired(std::chrono::steady_clock::now());
           }
           const auto active = rtsp_stream::get_all_session_client_uuids_no_cleanup();
-          for (const auto &[uuid, generation] : expired) {
-            if (std::find(active.begin(), active.end(), uuid) != active.end()) continue;
-            if (remote_owner_generation(uuid, remote_session::role_e::monitor) != generation) continue;
-            if (!release_mac_remote_monitor(uuid, generation, "Disconnected for 30 seconds")) continue;
-            BOOST_LOG(info) << "Removed disconnected Remote Monitor after grace period"sv;
+          // Recheck after taking the active snapshot. A teardown reservation
+          // may have been published after the initial guard; never release a
+          // display while that removal is still joining.
+          if (rtsp_stream::pending_policy::teardown_cleanup_allowed(
+                stream::session::teardown_sessions.load(std::memory_order_acquire),
+                rtsp_stream::pending_teardown_count())) {
+            for (const auto &[uuid, generation] : expired) {
+              if (std::find(active.begin(), active.end(), uuid) != active.end()) continue;
+              if (remote_owner_generation(uuid, remote_session::role_e::monitor) != generation) continue;
+              if (!release_mac_remote_monitor(uuid, generation, "Disconnected for 30 seconds")) continue;
+              BOOST_LOG(info) << "Removed disconnected Remote Monitor after grace period"sv;
+            }
           }
         }
         if (auto observed = platf::macos_virtual_display::remote_layout_changes()) {

@@ -125,6 +125,10 @@ namespace {
 #endif
 
 namespace rtsp_stream {
+  namespace {
+    std::atomic_uint pending_teardown_sessions {};
+  }
+
   void free_msg(PRTSP_MESSAGE msg) {
     freeMessage(msg);
 
@@ -1156,8 +1160,12 @@ namespace rtsp_stream {
       // but perform the potentially blocking join() outside of the lock to
       // avoid deadlocks. Each join serializes only its final ownership change.
       std::vector<std::shared_ptr<stream::session_t>> to_cleanup;
+      std::vector<pending_policy::teardown_reservation_t> teardown_reservations;
       [[maybe_unused]] bool vulkan_hdr_layer_active = false;
 
+      // Serialize the registry-removal linearization point with observers, but
+      // release before stop/join so an unbounded join never owns this gate.
+      std::unique_lock lifecycle_lock(nvhttp::stream_lifecycle_mutex());
       {
         auto lg = _session_state.lock();
 
@@ -1167,6 +1175,7 @@ namespace rtsp_stream {
             // Make a copy to operate on after releasing the lock
             auto session = *i;
             to_cleanup.emplace_back(session);
+            teardown_reservations.emplace_back(pending_teardown_sessions);
 
             // Remove from the active set now so counts reflect pending removal
             _session_state->client_uuids.erase(session.get());
@@ -1181,6 +1190,7 @@ namespace rtsp_stream {
         }
         vulkan_hdr_layer_active = vulkan_hdr_layer_active_locked();
       }
+      lifecycle_lock.unlock();
       set_vulkan_hdr_layer_streaming_active(vulkan_hdr_layer_active);
 
       // Stop and join outside the lock
@@ -1253,9 +1263,11 @@ namespace rtsp_stream {
       }
 
       std::vector<std::shared_ptr<stream::session_t>> to_cleanup;
+      std::vector<pending_policy::teardown_reservation_t> teardown_reservations;
       bool removed_pending = false;
       client_disconnect_result_t result;
       [[maybe_unused]] bool vulkan_hdr_layer_active = false;
+      std::unique_lock lifecycle_lock(nvhttp::stream_lifecycle_mutex());
       {
         std::lock_guard<std::mutex> lock {_launch_sessions_mutex};
         for (auto it = _launch_sessions.begin(); it != _launch_sessions.end();) {
@@ -1277,6 +1289,7 @@ namespace rtsp_stream {
           const auto it_uuid = _session_state->client_uuids.find(session.get());
           if (it_uuid != _session_state->client_uuids.end() && it_uuid->second == client_uuid) {
             to_cleanup.emplace_back(session);
+            teardown_reservations.emplace_back(pending_teardown_sessions);
             _session_state->client_uuids.erase(session.get());
             _session_state->vulkan_hdr_layer_sessions.erase(session.get());
             i = _session_state->sessions.erase(i);
@@ -1286,6 +1299,7 @@ namespace rtsp_stream {
         }
         vulkan_hdr_layer_active = vulkan_hdr_layer_active_locked();
       }
+      lifecycle_lock.unlock();
       set_vulkan_hdr_layer_streaming_active(vulkan_hdr_layer_active);
 
       for (auto &slot : to_cleanup) {
@@ -1308,6 +1322,7 @@ namespace rtsp_stream {
       const bool lifecycle_lock_held = false
     ) {
       std::vector<std::shared_ptr<stream::session_t>> to_cleanup;
+      std::vector<pending_policy::teardown_reservation_t> teardown_reservations;
       bool removed_pending = false;
       bool pending_launches_remain = false;
       [[maybe_unused]] bool vulkan_hdr_layer_active = false;
@@ -1348,6 +1363,7 @@ namespace rtsp_stream {
           if ((all_clients || stream::session::uuid_match(*session, client_uuid)) &&
               stream::session::remote_role_match(*session, role, generation)) {
             to_cleanup.emplace_back(session);
+            teardown_reservations.emplace_back(pending_teardown_sessions);
             _session_state->client_uuids.erase(session.get());
             _session_state->vulkan_hdr_layer_sessions.erase(session.get());
             it = _session_state->sessions.erase(it);
@@ -1775,6 +1791,10 @@ namespace rtsp_stream {
 
   int session_count_no_cleanup() {
     return server.session_count();
+  }
+
+  unsigned int pending_teardown_count() {
+    return pending_teardown_sessions.load(std::memory_order_acquire);
   }
 
   std::shared_ptr<stream::session_t> find_session(const std::string_view &uuid) {

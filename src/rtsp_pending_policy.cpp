@@ -56,6 +56,10 @@ namespace rtsp_stream::pending_policy {
     return game_runtime_active || has_processless_live_session || has_game_session_pending_or_draining;
   }
 
+  bool teardown_cleanup_allowed(const std::uint32_t active_teardown_sessions, const std::uint32_t pending_teardown_sessions) {
+    return active_teardown_sessions == 0 && pending_teardown_sessions == 0;
+  }
+
   bool disconnect_scope_matches(const remote_session::role_e candidate_role, const remote_session::role_e requested_role, const bool client_matches, const bool all_clients) {
     return candidate_role == requested_role && (all_clients || client_matches);
   }

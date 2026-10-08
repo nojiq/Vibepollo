@@ -363,6 +363,11 @@ namespace rtsp_stream {
    */
   int session_count_no_cleanup();
 
+  /**
+   * @brief Get the number of sessions removed from the RTSP registry awaiting join().
+   */
+  unsigned int pending_teardown_count();
+
   std::shared_ptr<stream::session_t>
     find_session(const std::string_view &uuid);
 
