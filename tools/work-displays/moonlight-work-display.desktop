@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Mac Work Display
+Comment=Reconnect the company-network Moonlight display
+Exec=systemctl --user restart moonlight-remote-monitor.service
+Icon=com.moonlight_stream.Moonlight
+Terminal=false
+Categories=Network;RemoteAccess;

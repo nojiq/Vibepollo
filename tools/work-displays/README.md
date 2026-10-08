@@ -71,7 +71,13 @@ journalctl --user -u moonlight-remote-monitor.service -f
 Do not add `JKS_Guest_2.4G` unless that network is intentionally trusted. The
 helper accepts the currently used wired company connection by subnet.
 
-To reconnect after manually quitting Moonlight:
+For one-click resume after manually quitting, install the optional app-menu entry:
+
+```bash
+install -Dm644 moonlight-work-display.desktop ~/.local/share/applications/moonlight-work-display.desktop
+```
+
+Open **Mac Work Display** from the app menu. The equivalent command is:
 
 ```bash
 systemctl --user restart moonlight-remote-monitor.service
