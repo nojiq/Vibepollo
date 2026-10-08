@@ -852,6 +852,14 @@ namespace platf::macos_virtual_display {
       return false;
     }
     layout_change_observer_t::positions_t expected;
+    struct applied_display_t {
+      std::string id;
+      CGDirectDisplayID display_id;
+      bool physical;
+      int requested_x;
+      int requested_y;
+    };
+    std::vector<applied_display_t> applied_displays;
     for (const auto &node : composed) {
       CGDirectDisplayID id = kCGNullDirectDisplay;
       if (node.preexisting) {
@@ -861,13 +869,23 @@ namespace platf::macos_virtual_display {
       }
       if (node.active && id != kCGNullDirectDisplay && is_active(id)) {
         CGConfigureDisplayOrigin(config, id, node.x, node.y);
-        const auto bounds = CGDisplayBounds(id);
-        expected[node.id] = {node.x, node.y, static_cast<int>(bounds.size.width), static_cast<int>(bounds.size.height)};
+        applied_displays.push_back({node.id, id, node.physical, node.x, node.y});
       }
     }
     // Like the game's virtual display, the arrangement lasts only while Vibepollo runs.
     const bool applied = CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly) == kCGErrorSuccess;
-    if (applied) layout_observer.topology_changed(std::chrono::steady_clock::now(), std::move(expected));
+    if (applied) {
+      for (const auto &display : applied_displays) {
+        const auto bounds = CGDisplayBounds(display.display_id);
+        // Physical origins come from the stable observer baseline. macOS may
+        // move them during a virtual-display hotplug; accepting that shift as
+        // a new baseline would move saved remote offsets on reconnect.
+        const int x = display.physical ? display.requested_x : static_cast<int>(bounds.origin.x);
+        const int y = display.physical ? display.requested_y : static_cast<int>(bounds.origin.y);
+        expected[display.id] = {x, y, static_cast<int>(bounds.size.width), static_cast<int>(bounds.size.height)};
+      }
+      layout_observer.topology_changed(std::chrono::steady_clock::now(), std::move(expected));
+    }
     return applied;
   }
 
