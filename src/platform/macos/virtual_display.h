@@ -72,6 +72,9 @@ namespace platf::macos_virtual_display {
   /// The active displays other than Remote Monitor ones, which the topology arranges them around.
   std::vector<remote_display_topology::node_t> remote_baseline();
 
+  /// Stable user rearrangements, excluding display creation/removal and our own moves.
+  std::optional<std::vector<remote_display_topology::node_t>> remote_layout_changes();
+
   /// Whether a display is one of the Remote Monitor displays.
   bool is_remote_display(std::uint32_t display_id);
 

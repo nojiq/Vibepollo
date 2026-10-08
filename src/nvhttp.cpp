@@ -83,6 +83,7 @@
 #endif
 #ifdef __APPLE__
   #include "platform/macos/virtual_display.h"
+  #include "platform/macos/remote_monitor_expiry.h"
 #endif
 
 #include "process.h"
@@ -702,6 +703,9 @@ namespace nvhttp {
   }  // namespace
 #elif defined(__APPLE__)
   namespace {
+    std::mutex mac_remote_expiry_mutex;
+    platf::macos_virtual_display::remote_monitor_expiry_t mac_remote_expiry;
+
     void refresh_remote_monitor_baseline(bool) {
       remote_display_topology::instance().set_physical_baseline(platf::macos_virtual_display::remote_baseline());
     }
@@ -723,6 +727,10 @@ namespace nvhttp {
           if (std::sscanf(std::string {requested_mode}.c_str(), "%dx%d@%d", &mode.width, &mode.height, &mode.refresh_hz) != 3 || mode.width <= 0 || mode.height <= 0 || mode.refresh_hz <= 0) {
             return remote_session::monitor_runtime_state_t {.retryable = true, .error = "Remote Monitor requested an invalid display mode."};
           }
+          {
+            std::lock_guard lock {mac_remote_expiry_mutex};
+            mac_remote_expiry.resumed(uuid);
+          }
           mode.hdr = hdr_requested;
           refresh_remote_monitor_baseline(has_stream_session_activity());
           const auto state = remote_display_topology::instance().activate_or_resume(std::string {uuid}, std::string {label}, mode, generation);
@@ -737,9 +745,13 @@ namespace nvhttp {
         },
         .transport_lost = [](std::string_view uuid, std::uint64_t generation) {
           remote_display_topology::instance().transport_lost(std::string {uuid}, generation);
+          std::lock_guard lock {mac_remote_expiry_mutex};
+          mac_remote_expiry.transport_lost(uuid, generation, std::chrono::steady_clock::now());
         },
         .unpair = [](std::string_view uuid) {
           remote_display_topology::instance().unpair_client(std::string {uuid});
+          std::lock_guard lock {mac_remote_expiry_mutex};
+          mac_remote_expiry.forget(uuid);
         },
         .shutdown = [] {
           remote_display_topology::instance().shutdown();
@@ -6572,6 +6584,56 @@ namespace nvhttp {
     std::thread ssl {accept_and_run, &https_server};
     std::thread tcp {accept_and_run, &http_server};
 
+#ifdef __APPLE__
+    util::jthread layout_memory_worker([](util::stop_token stop_token) {
+      platf::set_thread_name("layout_memory");
+      bool pending_save = false;
+      auto next_save_attempt = std::chrono::steady_clock::time_point {};
+      while (!stop_token.stop_requested()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (stop_token.stop_requested()) break;
+        // Serialize observation with launches/removals. The platform excludes
+        // their settling period, so temporary macOS moves cannot replace the
+        // user's last arrangement or a disconnected client's placement.
+        std::lock_guard lifecycle_lock {stream_lifecycle_mutex()};
+        // A lost transport retains its display briefly for Resume. Expire only
+        // that owner, never a peer or a replacement generation.
+        if (!rtsp_stream::has_pending_launch_or_startup() &&
+            stream::session::teardown_sessions.load(std::memory_order_acquire) == 0) {
+          std::vector<platf::macos_virtual_display::remote_monitor_expiry_t::expired_entry_t> expired;
+          {
+            std::lock_guard lock {mac_remote_expiry_mutex};
+            expired = mac_remote_expiry.expired(std::chrono::steady_clock::now());
+          }
+          const auto active = rtsp_stream::get_all_session_client_uuids();
+          for (const auto &[uuid, generation] : expired) {
+            if (std::find(active.begin(), active.end(), uuid) != active.end()) continue;
+            if (remote_owner_generation(uuid, remote_session::role_e::monitor) != generation) continue;
+            remote_session::release_monitor(uuid, generation, "Disconnected for 30 seconds");
+            forget_remote_owner(uuid, remote_session::role_e::monitor, generation);
+            BOOST_LOG(info) << "Removed disconnected Remote Monitor after grace period"sv;
+          }
+        }
+        if (auto observed = platf::macos_virtual_display::remote_layout_changes()) {
+          if (auto layout = remote_display_topology::instance().remember_positions(*observed)) {
+            {
+              std::lock_guard lock {client_mutex};
+              client_root.remote_display_layout_json = layout->dump();
+            }
+            pending_save = true;
+            next_save_attempt = {};
+          }
+        }
+        if (pending_save && std::chrono::steady_clock::now() >= next_save_attempt) {
+          pending_save = !save_state();
+          next_save_attempt = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+          if (!pending_save) BOOST_LOG(info) << "Remembered Remote Monitor arrangement"sv;
+          else BOOST_LOG(warning) << "Remote Monitor arrangement could not be saved; retrying"sv;
+        }
+      }
+    });
+#endif
+
     util::jthread pairing_expiry_worker([](util::stop_token stop_token) {
       platf::set_thread_name("pair_expiry");
       while (!stop_token.stop_requested()) {
@@ -6598,6 +6660,10 @@ namespace nvhttp {
 #endif
     pairing_expiry_worker.request_stop();
     pairing_expiry_worker.join();
+#ifdef __APPLE__
+    layout_memory_worker.request_stop();
+    layout_memory_worker.join();
+#endif
 
     {
       std::lock_guard pairing_lock {pairing_sessions_mutex};

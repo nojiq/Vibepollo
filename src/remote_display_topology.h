@@ -90,6 +90,10 @@ namespace remote_display_topology {
   public:
     void set_runtime_callbacks(runtime_callbacks_t callbacks);
     void set_layout(nlohmann::json layout);
+    // Record the latest platform-observed positions for ready Remote Monitor
+    // displays. The returned layout is present only when at least one saved
+    // placement changed; recording never applies the topology.
+    std::optional<nlohmann::json> remember_positions(const std::vector<node_t> &observed);
     void set_physical_baseline(std::vector<node_t> nodes);
     std::vector<std::string> physical_node_ids() const;
     // Managed ownership is independent of transport lifetime. A retryable or

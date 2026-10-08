@@ -1,12 +1,34 @@
 #include "remote_display_topology.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <set>
 #include <unordered_set>
+#include <utility>
 
 namespace remote_display_topology {
   namespace {
     constexpr int max_gap_px = 100000;
+
+    bool bounded_integer_offset(const nlohmann::json &value, std::int64_t &result) {
+      if (!value.is_number_integer()) return false;
+      if (value.is_number_unsigned() && value.get<std::uint64_t>() > max_gap_px) return false;
+      try {
+        result = value.get<std::int64_t>();
+      } catch (...) {
+        return false;
+      }
+      return result >= -max_gap_px && result <= max_gap_px;
+    }
+
+    std::optional<std::pair<int, int>> placement_offsets(const nlohmann::json &placement) {
+      if (!placement.contains("offset_x") && !placement.contains("offset_y")) return std::nullopt;
+      if (!placement.contains("offset_x") || !placement.contains("offset_y")) return std::nullopt;
+      std::int64_t x = 0;
+      std::int64_t y = 0;
+      if (!bounded_integer_offset(placement["offset_x"], x) || !bounded_integer_offset(placement["offset_y"], y)) return std::nullopt;
+      return std::pair {static_cast<int>(x), static_cast<int>(y)};
+    }
 
     bool contains(const std::vector<std::string> &values, const std::string &value) {
       return std::find(values.begin(), values.end(), value) != values.end();
@@ -44,6 +66,20 @@ namespace remote_display_topology {
       if (placement.contains("primary") && !placement["primary"].is_boolean()) {
         error = "Placement primary must be a boolean.";
         return false;
+      }
+      const bool has_offset_x = placement.contains("offset_x");
+      const bool has_offset_y = placement.contains("offset_y");
+      if (has_offset_x != has_offset_y) {
+        error = "Placement offsets must include both offset_x and offset_y.";
+        return false;
+      }
+      if (has_offset_x) {
+        std::int64_t ignored_x = 0;
+        std::int64_t ignored_y = 0;
+        if (!bounded_integer_offset(placement["offset_x"], ignored_x) || !bounded_integer_offset(placement["offset_y"], ignored_y)) {
+          error = "Placement offsets must be bounded integers.";
+          return false;
+        }
       }
       const auto gap = placement["gap_px"].get<int>();
       if ((placement["anchor_kind"].get<std::string>() != "physical" && placement["anchor_kind"].get<std::string>() != "client") || placement["anchor_id"].get<std::string>().empty() || !edges.contains(placement["edge"].get<std::string>()) || !alignments.contains(placement["alignment"].get<std::string>()) || gap < 0 || gap > max_gap_px) {
@@ -105,6 +141,69 @@ namespace remote_display_topology {
 
   void coordinator_t::set_runtime_callbacks(runtime_callbacks_t callbacks) { std::lock_guard lock(mutex_); callbacks_ = std::move(callbacks); }
   void coordinator_t::set_layout(nlohmann::json layout) { std::lock_guard lock(mutex_); layout_ = normalize_layout(layout); }
+
+  std::optional<nlohmann::json> coordinator_t::remember_positions(const std::vector<node_t> &observed) {
+    std::lock_guard lock(mutex_);
+
+    // A physical monitor is the only stable anchor. Prefer the platform's
+    // primary display, then the conventional stable id "main", then the
+    // first active physical monitor. Remote displays are never anchors.
+    const node_t *anchor = nullptr;
+    for (const auto &node : observed) {
+      if (node.physical && node.active && node.primary) {
+        anchor = &node;
+        break;
+      }
+    }
+    if (!anchor) {
+      for (const auto &node : observed) {
+        const auto owner = clients_.find(node.id);
+        const bool remote_owned = owner != clients_.end() && owner->second.remote_monitor;
+        if (node.active && node.id == "main" && !remote_owned) {
+          anchor = &node;
+          break;
+        }
+      }
+    }
+    if (!anchor) {
+      for (const auto &node : observed) {
+        if (node.physical && node.active) {
+          anchor = &node;
+          break;
+        }
+      }
+    }
+    if (!anchor || anchor->id.empty()) return std::nullopt;
+
+    auto &placements = layout_["placements"];
+    bool changed = false;
+    for (const auto &node : observed) {
+      if (node.id.empty() || node.physical || !node.active) continue;
+      const auto state = clients_.find(node.id);
+      if (state == clients_.end() || !state->second.remote_monitor || state->second.lifecycle != lifecycle_e::ready) continue;
+
+      const auto offset_x = static_cast<std::int64_t>(node.x) - static_cast<std::int64_t>(anchor->x);
+      const auto offset_y = static_cast<std::int64_t>(node.y) - static_cast<std::int64_t>(anchor->y);
+      if (offset_x < -max_gap_px || offset_x > max_gap_px || offset_y < -max_gap_px || offset_y > max_gap_px) continue;
+
+      nlohmann::json placement = placements.contains(node.id) && placements[node.id].is_object() ? placements[node.id] : nlohmann::json::object();
+      if (!placement.contains("anchor_kind")) placement["anchor_kind"] = "physical";
+      if (!placement.contains("edge")) placement["edge"] = "right";
+      if (!placement.contains("alignment")) placement["alignment"] = "center";
+      if (!placement.contains("gap_px")) placement["gap_px"] = 0;
+      placement["anchor_kind"] = "physical";
+      placement["anchor_id"] = anchor->id;
+      placement["offset_x"] = static_cast<int>(offset_x);
+      placement["offset_y"] = static_cast<int>(offset_y);
+      if (placements.find(node.id) == placements.end() || placements[node.id] != placement) {
+        placements[node.id] = std::move(placement);
+        changed = true;
+      }
+    }
+    if (!changed) return std::nullopt;
+    return layout_;
+  }
+
   void coordinator_t::set_physical_baseline(std::vector<node_t> nodes) { std::lock_guard lock(mutex_); physical_baseline_ = std::move(nodes); }
   std::vector<std::string> coordinator_t::physical_node_ids() const {
     std::lock_guard lock(mutex_);
@@ -623,12 +722,17 @@ namespace remote_display_topology {
       const auto gap = placement.value("gap_px", 0);
       const auto edge = placement.value("edge", "right");
       const auto alignment = placement.value("alignment", "center");
-      if (edge == "left") node.x = anchor->x - width - gap;
-      if (edge == "right") node.x = anchor->x + anchor_width + gap;
-      if (edge == "above") node.y = anchor->y - height - gap;
-      if (edge == "below") node.y = anchor->y + anchor_height + gap;
-      if (edge == "left" || edge == "right") node.y = alignment == "start" ? anchor->y : alignment == "end" ? anchor->y + anchor_height - height : anchor->y + (anchor_height - height) / 2;
-      if (edge == "above" || edge == "below") node.x = alignment == "start" ? anchor->x : alignment == "end" ? anchor->x + anchor_width - width : anchor->x + (anchor_width - width) / 2;
+      if (const auto offsets = placement_offsets(placement)) {
+        node.x = anchor->x + offsets->first;
+        node.y = anchor->y + offsets->second;
+      } else {
+        if (edge == "left") node.x = anchor->x - width - gap;
+        if (edge == "right") node.x = anchor->x + anchor_width + gap;
+        if (edge == "above") node.y = anchor->y - height - gap;
+        if (edge == "below") node.y = anchor->y + anchor_height + gap;
+        if (edge == "left" || edge == "right") node.y = alignment == "start" ? anchor->y : alignment == "end" ? anchor->y + anchor_height - height : anchor->y + (anchor_height - height) / 2;
+        if (edge == "above" || edge == "below") node.x = alignment == "start" ? anchor->x : alignment == "end" ? anchor->x + anchor_width - width : anchor->x + (anchor_width - width) / 2;
+      }
       rightmost = std::max(rightmost, node.x + width);
       nodes.push_back(std::move(node));
       emitted.insert(uuid);

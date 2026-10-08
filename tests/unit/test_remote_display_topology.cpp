@@ -939,3 +939,141 @@ TEST(RemoteDisplayTopology, MissingAnchorAppendsAndReleasingOnePeerPreservesTheO
   ASSERT_FALSE(applied.empty());
   EXPECT_EQ(applied.back(), std::vector<std::string>({"two"}));
 }
+
+TEST(RemoteDisplayTopology, RejectsPartialNonIntegerAndOutOfBoundsOffsets) {
+  const std::vector<std::string> known_clients {"one"};
+  const std::vector<std::string> physical {"main"};
+  for (const auto &placement : std::vector<nlohmann::json> {
+         { {"anchor_kind", "physical"}, {"anchor_id", "main"}, {"edge", "right"}, {"alignment", "center"}, {"gap_px", 0}, {"offset_x", 1} },
+         { {"anchor_kind", "physical"}, {"anchor_id", "main"}, {"edge", "right"}, {"alignment", "center"}, {"gap_px", 0}, {"offset_x", "1"}, {"offset_y", 0} },
+         { {"anchor_kind", "physical"}, {"anchor_id", "main"}, {"edge", "right"}, {"alignment", "center"}, {"gap_px", 0}, {"offset_x", 100001}, {"offset_y", 0} },
+       }) {
+    std::string error;
+    EXPECT_FALSE(remote_display_topology::validate_layout(layout({{"one", placement}}), known_clients, physical, error));
+  }
+}
+
+TEST(RemoteDisplayTopology, RemembersNegativeAndDownwardPositionsRelativeToPrimaryPhysical) {
+  remote_display_topology::coordinator_t coordinator;
+  std::vector<remote_display_topology::node_t> applied;
+  int apply_count = 0;
+  const remote_display_topology::node_t main {
+    .id = "main",
+    .label = "Built-in",
+    .physical = true,
+    .active = true,
+    .primary = true,
+    .x = 100,
+    .y = 50,
+    .configured_mode = {1920, 1080, 60},
+  };
+  coordinator.set_physical_baseline({main});
+  coordinator.set_runtime_callbacks({
+    .create_or_reclaim = [](const auto &, const auto &, const auto &) { return true; },
+    .apply_composed_topology = [&applied, &apply_count](const auto &nodes) {
+      applied = nodes;
+      ++apply_count;
+      return true;
+    },
+    .exact_target_has_current_mode_and_dxgi = [](const auto &, const auto &) { return std::optional<std::string> {"remote-output"}; },
+  });
+  ASSERT_TRUE(coordinator.activate_or_resume("surface", "Surface", {}, 1).ready);
+
+  const std::vector<remote_display_topology::node_t> observed {
+    main,
+    remote_display_topology::node_t {
+      .id = "surface",
+      .label = "Surface",
+      .active = true,
+      .x = -300,
+      .y = 200,
+    },
+  };
+  const auto saved = coordinator.remember_positions(observed);
+  ASSERT_TRUE(saved.has_value());
+  EXPECT_EQ((*saved)["placements"]["surface"]["anchor_kind"], "physical");
+  EXPECT_EQ((*saved)["placements"]["surface"]["anchor_id"], "main");
+  EXPECT_EQ((*saved)["placements"]["surface"]["offset_x"], -400);
+  EXPECT_EQ((*saved)["placements"]["surface"]["offset_y"], 150);
+  EXPECT_EQ(apply_count, 1);
+
+  EXPECT_FALSE(coordinator.remember_positions(observed).has_value());
+  EXPECT_EQ(apply_count, 1);
+  ASSERT_TRUE(coordinator.reapply_composed_topology());
+  const auto composed = std::find_if(applied.begin(), applied.end(), [](const auto &node) { return node.id == "surface"; });
+  ASSERT_NE(composed, applied.end());
+  EXPECT_EQ(composed->x, -300);
+  EXPECT_EQ(composed->y, 200);
+}
+
+TEST(RemoteDisplayTopology, PreservesAbsentOrNotReadySavedClients) {
+  remote_display_topology::coordinator_t coordinator;
+  const auto saved_two = nlohmann::json {
+    {"anchor_kind", "physical"}, {"anchor_id", "main"}, {"edge", "left"}, {"alignment", "start"}, {"gap_px", 12}, {"offset_x", -2400}, {"offset_y", 3}
+  };
+  coordinator.set_layout(layout({{"one", { {"anchor_kind", "physical"}, {"anchor_id", "main"}, {"edge", "right"}, {"alignment", "center"}, {"gap_px", 0}, {"offset_x", 0}, {"offset_y", 0} }}, {"two", saved_two}}));
+  coordinator.set_runtime_callbacks({
+    .create_or_reclaim = [](const auto &, const auto &, const auto &) { return true; },
+    .apply_composed_topology = [](const auto &) { return true; },
+    .exact_target_has_current_mode_and_dxgi = [](const auto &, const auto &) { return std::optional<std::string> {"remote-output"}; },
+  });
+  ASSERT_TRUE(coordinator.activate_or_resume("one", "One", {}, 1).ready);
+  coordinator.transport_lost("one", 1);
+
+  const std::vector<remote_display_topology::node_t> observed {
+    {.id = "main", .physical = true, .active = true, .primary = true},
+    {.id = "one", .active = true, .x = 800, .y = 10},
+    {.id = "two", .active = true, .x = 900, .y = 20},
+  };
+  EXPECT_FALSE(coordinator.remember_positions(observed).has_value());
+  EXPECT_EQ(coordinator.snapshot({})["layout"]["placements"]["two"], saved_two);
+  EXPECT_EQ(coordinator.snapshot({})["layout"]["placements"]["one"]["offset_x"], 0);
+}
+
+TEST(RemoteDisplayTopology, UsesStableMainPhysicalAnchorWhenNoPhysicalIsPrimaryAndIgnoresRemoteAnchor) {
+  remote_display_topology::coordinator_t coordinator;
+  coordinator.set_runtime_callbacks({
+    .create_or_reclaim = [](const auto &, const auto &, const auto &) { return true; },
+    .apply_composed_topology = [](const auto &) { return true; },
+    .exact_target_has_current_mode_and_dxgi = [](const auto &, const auto &) { return std::optional<std::string> {"remote-output"}; },
+  });
+  ASSERT_TRUE(coordinator.activate_or_resume("surface", "Surface", {}, 1).ready);
+  const auto saved = coordinator.remember_positions({
+    {.id = "surface", .active = true, .x = 10, .y = 20},
+    {.id = "secondary", .physical = true, .active = true, .x = 2000, .y = 0},
+    {.id = "main", .physical = true, .active = true, .x = 100, .y = 40},
+  });
+  ASSERT_TRUE(saved.has_value());
+  EXPECT_EQ((*saved)["placements"]["surface"]["anchor_id"], "main");
+  EXPECT_EQ((*saved)["placements"]["surface"]["offset_x"], -90);
+  EXPECT_EQ((*saved)["placements"]["surface"]["offset_y"], -20);
+}
+
+TEST(RemoteDisplayTopology, SavedPositionsAreIndependentOfReconnectOrder) {
+  const auto saved = layout({
+    {"surface", { {"anchor_kind", "physical"}, {"anchor_id", "main"}, {"edge", "right"}, {"alignment", "center"}, {"gap_px", 0}, {"offset_x", -400}, {"offset_y", 200} }},
+    {"msi", { {"anchor_kind", "physical"}, {"anchor_id", "main"}, {"edge", "left"}, {"alignment", "end"}, {"gap_px", 0}, {"offset_x", 2200}, {"offset_y", -100} }},
+  });
+  remote_display_topology::coordinator_t coordinator;
+  std::vector<remote_display_topology::node_t> composed;
+  coordinator.set_physical_baseline({{.id = "main", .physical = true, .active = true, .primary = true, .configured_mode = {1920, 1080, 60}}});
+  coordinator.set_layout(saved);
+  coordinator.set_runtime_callbacks({
+    .create_or_reclaim = [](const auto &, const auto &, const auto &) { return true; },
+    .apply_composed_topology = [&composed](const auto &nodes) { composed = nodes; return true; },
+    .exact_target_has_current_mode_and_dxgi = [](const auto &uuid, const auto &) { return std::optional<std::string> {uuid}; },
+  });
+  ASSERT_TRUE(coordinator.activate_or_resume("msi", "MSI", {}, 1).ready);
+  ASSERT_TRUE(coordinator.activate_or_resume("surface", "Surface", {}, 1).ready);
+  const auto find_node = [&](const std::string &id) {
+    return std::find_if(composed.begin(), composed.end(), [&](const auto &node) { return node.id == id; });
+  };
+  const auto msi = find_node("msi");
+  const auto surface = find_node("surface");
+  ASSERT_NE(msi, composed.end());
+  ASSERT_NE(surface, composed.end());
+  EXPECT_EQ(msi->x, 2200);
+  EXPECT_EQ(msi->y, -100);
+  EXPECT_EQ(surface->x, -400);
+  EXPECT_EQ(surface->y, 200);
+}

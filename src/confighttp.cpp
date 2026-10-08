@@ -79,6 +79,8 @@
   #include "platform/linux/capture_status.h"
   #include "platform/linux/private_display.h"
   #include "src/platform/linux/display_backend.h"
+#elif defined(__APPLE__)
+  #include "platform/macos/virtual_display.h"
 #endif
 
 #include <nlohmann/json.hpp>
@@ -2660,6 +2662,9 @@ namespace confighttp {
   }
 
   void refresh_remote_display_physical_baseline() {
+#ifdef __APPLE__
+    remote_display_topology::instance().set_physical_baseline(platf::macos_virtual_display::remote_baseline());
+#else
     try {
       const auto devices = nlohmann::json::parse(display_helper_integration::enumerate_devices_json(display_device::DeviceEnumerationDetail::Full));
       if (!devices.is_array()) return;
@@ -2686,6 +2691,7 @@ namespace confighttp {
     } catch (const std::exception &e) {
       BOOST_LOG(warning) << "Remote display layout could not refresh physical monitor baseline: " << e.what();
     }
+#endif
   }
 
   void getClientDisplayLayout(resp_https_t response, req_https_t request) {

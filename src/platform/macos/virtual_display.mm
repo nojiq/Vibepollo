@@ -54,6 +54,7 @@
 #include "src/remote_display_topology.h"
 #include "src/video.h"
 #include "virtual_display.h"
+#include "layout_change_observer.h"
 
 extern char **environ;
 
@@ -737,6 +738,7 @@ namespace platf::macos_virtual_display {
 
     std::mutex remote_mutex;  ///< Held while displays are created, which takes seconds.
     std::map<std::string, remote_display_t> remote_displays;  ///< By client UUID.
+    layout_change_observer_t layout_observer;  ///< Guarded by remote_mutex.
 
     // The displays' IDs, for lookups from input and capture that mustn't wait on remote_mutex.
     std::mutex remote_ids_mutex;
@@ -812,6 +814,7 @@ namespace platf::macos_virtual_display {
     }
 
     // A new mode gets a new display: two at once with the same serial would confuse macOS.
+    layout_observer.topology_changed(std::chrono::steady_clock::now());
     remote.display.reset();
     publish_remote_ids();
     NSString *name = client_label.empty() ? @PROJECT_NAME " Remote Monitor" : @(client_label.c_str());
@@ -832,10 +835,12 @@ namespace platf::macos_virtual_display {
 
   bool remote_apply_composed_topology(const std::vector<remote_display_topology::node_t> &composed) {
     std::lock_guard lock {remote_mutex};
+    layout_observer.topology_changed(std::chrono::steady_clock::now());
     CGDisplayConfigRef config;
     if (CGBeginDisplayConfiguration(&config) != kCGErrorSuccess) {
       return false;
     }
+    layout_change_observer_t::positions_t expected;
     for (const auto &node : composed) {
       CGDirectDisplayID id = kCGNullDirectDisplay;
       if (node.preexisting) {
@@ -845,10 +850,14 @@ namespace platf::macos_virtual_display {
       }
       if (node.active && id != kCGNullDirectDisplay && is_active(id)) {
         CGConfigureDisplayOrigin(config, id, node.x, node.y);
+        const auto bounds = CGDisplayBounds(id);
+        expected[node.id] = {node.x, node.y, static_cast<int>(bounds.size.width), static_cast<int>(bounds.size.height)};
       }
     }
     // Like the game's virtual display, the arrangement lasts only while Vibepollo runs.
-    return CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly) == kCGErrorSuccess;
+    const bool applied = CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly) == kCGErrorSuccess;
+    if (applied) layout_observer.topology_changed(std::chrono::steady_clock::now(), std::move(expected));
+    return applied;
   }
 
   std::optional<std::string> remote_exact_capture_output(const std::string &client_uuid, const remote_display_topology::mode_t &) {
@@ -868,6 +877,7 @@ namespace platf::macos_virtual_display {
 
   bool remote_remove_owned_display(const std::string &client_uuid) {
     std::lock_guard lock {remote_mutex};
+    layout_observer.topology_changed(std::chrono::steady_clock::now());
     remote_displays.erase(client_uuid);
     publish_remote_ids();
     return true;
@@ -901,6 +911,32 @@ namespace platf::macos_virtual_display {
       baseline.push_back(std::move(node));
     }
     return baseline;
+  }
+
+  std::optional<std::vector<remote_display_topology::node_t>> remote_layout_changes() {
+    @autoreleasepool {
+      std::lock_guard lock {remote_mutex};
+      if (remote_displays.empty()) return std::nullopt;
+      auto nodes = remote_baseline();
+      for (const auto &[uuid, remote] : remote_displays) {
+        if (!remote.display || !is_active(remote.display->id)) continue;
+        const auto bounds = CGDisplayBounds(remote.display->id);
+        remote_display_topology::node_t node;
+        node.id = uuid;
+        node.active = true;
+        node.x = static_cast<int>(bounds.origin.x);
+        node.y = static_cast<int>(bounds.origin.y);
+        node.layout_width = static_cast<int>(bounds.size.width);
+        node.layout_height = static_cast<int>(bounds.size.height);
+        nodes.push_back(std::move(node));
+      }
+      layout_change_observer_t::positions_t positions;
+      for (const auto &node : nodes) {
+        positions[node.id] = {node.x, node.y, node.layout_width.value_or(0), node.layout_height.value_or(0)};
+      }
+      if (!layout_observer.observe(positions, std::chrono::steady_clock::now())) return std::nullopt;
+      return nodes;
+    }
   }
 
   bool is_remote_display(const std::uint32_t display_id) {

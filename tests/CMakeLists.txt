@@ -319,6 +319,16 @@ sunshine_add_test_target(
 )
 
 sunshine_add_test_target(
+    NAME test_fast_mac_work_displays
+    CATEGORY fast
+    TEST_SOURCES
+        "${CMAKE_CURRENT_LIST_DIR}/tests_main.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/unit/test_mac_layout_change_observer.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/unit/test_mac_remote_monitor_expiry.cpp"
+    LINK_LIBRARIES GTest::gtest
+)
+
+sunshine_add_test_target(
     NAME test_fast_nvenc_api
     CATEGORY fast
     TEST_SOURCES
