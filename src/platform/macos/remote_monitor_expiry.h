@@ -36,6 +36,8 @@ namespace platf::macos_virtual_display {
       clock::time_point now
     ) {
       if (client_uuid.empty()) return;
+      const auto existing = pending_.find(std::string {client_uuid});
+      if (existing != pending_.end() && existing->second.generation > generation) return;
       pending_[std::string {client_uuid}] = pending_t {
         .generation = generation,
         .deadline = now + grace_period,
@@ -50,6 +52,12 @@ namespace platf::macos_virtual_display {
     /** Forget all state for an unpaired client. */
     void forget(std::string_view client_uuid) {
       pending_.erase(std::string {client_uuid});
+    }
+
+    /** A delayed release must not cancel a newer launch's timer. */
+    void forget(std::string_view client_uuid, generation_t generation) {
+      const auto it = pending_.find(std::string {client_uuid});
+      if (it != pending_.end() && it->second.generation == generation) pending_.erase(it);
     }
 
     /**

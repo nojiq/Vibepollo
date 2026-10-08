@@ -57,3 +57,21 @@ TEST(MacRemoteMonitorExpiry, ForgetRemovesUnpairedClientTimer) {
 
   EXPECT_TRUE(expiry.expired(start + 30s).empty());
 }
+
+TEST(MacRemoteMonitorExpiry, OlderNotificationCannotReplaceNewerTimer) {
+  expiry_t expiry;
+  expiry.transport_lost("surface", 12, start);
+  expiry.transport_lost("surface", 11, start + 1s);
+  const auto due = expiry.expired(start + 30s);
+  ASSERT_EQ(due.size(), 1u);
+  EXPECT_EQ(due[0], (expiry_t::expired_entry_t {"surface", 12}));
+}
+
+TEST(MacRemoteMonitorExpiry, OlderReleaseCannotCancelNewerTimer) {
+  expiry_t expiry;
+  expiry.transport_lost("surface", 12, start);
+  expiry.forget("surface", 11);
+  const auto due = expiry.expired(start + 30s);
+  ASSERT_EQ(due.size(), 1u);
+  EXPECT_EQ(due[0], (expiry_t::expired_entry_t {"surface", 12}));
+}

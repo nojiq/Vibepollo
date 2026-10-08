@@ -99,6 +99,15 @@ using namespace std::literals;
 
 namespace nvhttp {
 
+#ifdef __APPLE__
+  bool mac_remote_monitor_retained(std::string_view client_uuid);
+  void rearm_mac_remote_monitor_expiry(std::string_view client_uuid);
+  void rearm_mac_remote_monitor_expiry_for_generation(std::string_view client_uuid, std::uint64_t generation);
+  void forget_mac_remote_monitor_expiry_for_generation(std::string_view client_uuid, std::uint64_t generation);
+  bool finalize_mac_remote_monitor_release(std::string_view client_uuid, std::uint64_t generation);
+  bool release_mac_remote_monitor(std::string_view client_uuid, std::uint64_t generation, std::string_view reason);
+#endif
+
   namespace {
     struct remote_role_owner_t {
       remote_session::role_e role {remote_session::role_e::none};
@@ -156,7 +165,14 @@ namespace nvhttp {
 
     void remember_remote_owner(std::string_view uuid, remote_session::role_e role, std::uint64_t generation) {
       std::lock_guard lock {remote_role_owners_mutex};
-      remote_role_owners.insert_or_assign(remote_role_owner_key(uuid, role), remote_role_owner_t {role, generation});
+      const auto key = remote_role_owner_key(uuid, role);
+#ifdef __APPLE__
+      // Activation completion can be delayed past a newer generation. Keep a
+      // late completion from replacing the newer owner map entry.
+      const auto it = remote_role_owners.find(key);
+      if (it != remote_role_owners.end() && it->second.generation > generation) return;
+#endif
+      remote_role_owners.insert_or_assign(key, remote_role_owner_t {role, generation});
     }
 
     std::optional<std::uint64_t> remote_owner_generation(std::string_view uuid, remote_session::role_e role) {
@@ -173,11 +189,25 @@ namespace nvhttp {
     }
 
     void forget_remote_client(std::string_view uuid) {
+#ifdef __APPLE__
+      const bool preserve_monitor_owner = mac_remote_monitor_retained(uuid);
+#endif
       {
         std::lock_guard lock {remote_role_owners_mutex};
+#ifdef __APPLE__
+        if (!preserve_monitor_owner) {
+          remote_role_owners.erase(remote_role_owner_key(uuid, remote_session::role_e::monitor));
+        }
+#else
         remote_role_owners.erase(remote_role_owner_key(uuid, remote_session::role_e::monitor));
+#endif
         remote_role_owners.erase(remote_role_owner_key(uuid, remote_session::role_e::input));
       }
+#ifdef __APPLE__
+      if (preserve_monitor_owner) {
+        rearm_mac_remote_monitor_expiry(uuid);
+      }
+#endif
       remote_session::clear_app_replacement_confirmation(uuid);
     }
 
@@ -211,7 +241,11 @@ namespace nvhttp {
   }
 
   void notify_remote_monitor_released(const std::string_view client_uuid, const std::uint64_t generation) {
+#ifdef __APPLE__
+    (void) finalize_mac_remote_monitor_release(client_uuid, generation);
+#else
     forget_remote_owner(client_uuid, remote_session::role_e::monitor, generation);
+#endif
   }
 
   namespace fs = std::filesystem;
@@ -727,13 +761,24 @@ namespace nvhttp {
           if (std::sscanf(std::string {requested_mode}.c_str(), "%dx%d@%d", &mode.width, &mode.height, &mode.refresh_hz) != 3 || mode.width <= 0 || mode.height <= 0 || mode.refresh_hz <= 0) {
             return remote_session::monitor_runtime_state_t {.retryable = true, .error = "Remote Monitor requested an invalid display mode."};
           }
-          {
-            std::lock_guard lock {mac_remote_expiry_mutex};
-            mac_remote_expiry.resumed(uuid);
-          }
           mode.hdr = hdr_requested;
           refresh_remote_monitor_baseline(has_stream_session_activity());
           const auto state = remote_display_topology::instance().activate_or_resume(std::string {uuid}, std::string {label}, mode, generation);
+          if (state.accepted) {
+            // The topology coordinator deliberately accepts older generations
+            // as an idempotent no-op.  A delayed launch must not re-arm the
+            // current client's expiry timer or publish stale ownership.
+            if (!remote_display_topology::instance().snapshot(std::string {uuid}, generation).accepted) {
+              return remote_session::monitor_runtime_state_t {
+                .retryable = true,
+                .error = "Stale Remote Monitor activation was ignored."
+              };
+            }
+            remember_remote_owner(uuid, remote_session::role_e::monitor, generation);
+            // Also bound a launch that creates a display but never starts RTSP.
+            std::lock_guard lock {mac_remote_expiry_mutex};
+            mac_remote_expiry.transport_lost(uuid, generation, std::chrono::steady_clock::now());
+          }
           return {.accepted = state.accepted, .ready = state.ready, .retryable = state.retryable, .output = state.output, .error = state.error, .hdr_enabled = state.hdr_enabled};
         },
         .snapshot = [](std::string_view uuid, std::uint64_t generation) {
@@ -741,14 +786,18 @@ namespace nvhttp {
           return remote_session::monitor_runtime_state_t {.accepted = state.accepted, .ready = state.ready, .retryable = state.retryable, .output = state.output, .error = state.error, .hdr_enabled = state.hdr_enabled};
         },
         .explicit_release = [](std::string_view uuid, std::uint64_t generation, std::string_view reason) {
+          refresh_remote_monitor_baseline(false);
           remote_display_topology::instance().explicit_release(std::string {uuid}, generation, std::string {reason});
         },
         .transport_lost = [](std::string_view uuid, std::uint64_t generation) {
           remote_display_topology::instance().transport_lost(std::string {uuid}, generation);
-          std::lock_guard lock {mac_remote_expiry_mutex};
-          mac_remote_expiry.transport_lost(uuid, generation, std::chrono::steady_clock::now());
+          if (remote_display_topology::instance().snapshot(std::string {uuid}, generation).accepted) {
+            std::lock_guard lock {mac_remote_expiry_mutex};
+            mac_remote_expiry.transport_lost(uuid, generation, std::chrono::steady_clock::now());
+          }
         },
         .unpair = [](std::string_view uuid) {
+          refresh_remote_monitor_baseline(false);
           remote_display_topology::instance().unpair_client(std::string {uuid});
           std::lock_guard lock {mac_remote_expiry_mutex};
           mac_remote_expiry.forget(uuid);
@@ -759,6 +808,63 @@ namespace nvhttp {
       });
     }
   }  // namespace
+#endif
+
+#ifdef __APPLE__
+  bool mac_remote_monitor_retained(const std::string_view client_uuid) {
+    const auto retained = remote_display_topology::instance().protected_remote_monitor_client_ids();
+    return std::find(retained.begin(), retained.end(), client_uuid) != retained.end();
+  }
+
+  void rearm_mac_remote_monitor_expiry(const std::string_view client_uuid) {
+    const auto generation = remote_owner_generation(client_uuid, remote_session::role_e::monitor);
+    if (!generation) return;
+    rearm_mac_remote_monitor_expiry_for_generation(client_uuid, *generation);
+  }
+
+  void rearm_mac_remote_monitor_expiry_for_generation(const std::string_view client_uuid, const std::uint64_t generation) {
+    std::lock_guard lock {mac_remote_expiry_mutex};
+    if (remote_owner_generation(client_uuid, remote_session::role_e::monitor) != generation) return;
+    mac_remote_expiry.transport_lost(client_uuid, generation, std::chrono::steady_clock::now());
+  }
+
+  void forget_mac_remote_monitor_expiry_for_generation(const std::string_view client_uuid, const std::uint64_t generation) {
+    std::lock_guard lock {mac_remote_expiry_mutex};
+    mac_remote_expiry.forget(client_uuid, generation);
+  }
+
+  bool finalize_mac_remote_monitor_release(const std::string_view client_uuid, const std::uint64_t generation) {
+    const auto owner = remote_owner_generation(client_uuid, remote_session::role_e::monitor);
+    if (owner && *owner != generation) {
+      // A delayed completion from an older stream must not touch the newer owner.
+      return false;
+    }
+
+    const auto state = remote_display_topology::instance().snapshot(std::string {client_uuid}, generation);
+    if (!state.accepted) {
+      if (!owner || *owner != generation) return false;
+      forget_remote_owner(client_uuid, remote_session::role_e::monitor, generation);
+      forget_mac_remote_monitor_expiry_for_generation(client_uuid, generation);
+      return true;
+    }
+
+    if (mac_remote_monitor_retained(client_uuid)) {
+      // The topology callback kept ownership after a failed apply/remove.
+      // Keep the owner visible and give the worker another retry window.
+      remember_remote_owner(client_uuid, remote_session::role_e::monitor, generation);
+      rearm_mac_remote_monitor_expiry_for_generation(client_uuid, generation);
+      return false;
+    }
+
+    forget_remote_owner(client_uuid, remote_session::role_e::monitor, generation);
+    forget_mac_remote_monitor_expiry_for_generation(client_uuid, generation);
+    return true;
+  }
+
+  bool release_mac_remote_monitor(const std::string_view client_uuid, const std::uint64_t generation, const std::string_view reason) {
+    remote_session::release_monitor(client_uuid, generation, reason);
+    return finalize_mac_remote_monitor_release(client_uuid, generation);
+  }
 #endif
 
   std::string cert_subject_name_for_log(const crypto::x509_t &cert) {
@@ -4465,13 +4571,27 @@ namespace nvhttp {
             false
           );
           if (role == remote_session::role_e::monitor) {
+#ifdef __APPLE__
+            (void) release_mac_remote_monitor(
+              request_client_identity.uuid,
+              *generation,
+              "Disconnect Monitor"
+            );
+#else
             remote_session::release_monitor(
               request_client_identity.uuid,
               *generation,
               "Disconnect Monitor"
             );
+#endif
           }
+#ifndef __APPLE__
           forget_remote_owner(request_client_identity.uuid, role, *generation);
+#else
+          if (role != remote_session::role_e::monitor) {
+            forget_remote_owner(request_client_identity.uuid, role, *generation);
+          }
+#endif
 #if defined(_WIN32) || defined(__linux__)
           if (role == remote_session::role_e::monitor) {
             cleanup_virtual_display_if_idle();
@@ -4626,6 +4746,20 @@ namespace nvhttp {
             launch_session->role_generation
           );
           if (monitor.accepted) {
+#ifdef __APPLE__
+            // The activation hook can complete before a newer launch wins the
+            // coordinator generation.  Do not let this older launch overwrite
+            // the owner map after that handoff.
+            if (!remote_display_topology::instance().snapshot(
+                  request_client_identity.uuid,
+                  launch_session->role_generation
+                ).accepted) {
+              tree.put("root.resume", 0);
+              tree.put("root.<xmlattr>.status_code", 409);
+              tree.put("root.<xmlattr>.status_message", "Remote Monitor activation was superseded by a newer generation");
+              return;
+            }
+#endif
             // Publish retryable ownership as well as ready ownership. This makes
             // the reduced Resume/Disconnect Monitor catalogue reachable after a
             // failed apply, and the next Resume retries with a new generation.
@@ -4655,8 +4789,16 @@ namespace nvhttp {
         stream::session::arm_shared_runtime_cleanup(launch_session->virtual_display_guid_bytes);
         if (!paired_client_uuid_enabled(launch_session->client_uuid, verified_client->perm)) {
           if (launch_session->role == remote_session::role_e::monitor) {
+#ifdef __APPLE__
+            (void) release_mac_remote_monitor(
+              request_client_identity.uuid,
+              launch_session->role_generation,
+              "Paired client authorization revoked"
+            );
+#else
             remote_session::release_monitor(request_client_identity.uuid, launch_session->role_generation, "Paired client authorization revoked");
             forget_remote_owner(request_client_identity.uuid, launch_session->role, launch_session->role_generation);
+#endif
 #if defined(_WIN32) || defined(__linux__)
             cleanup_virtual_display_if_idle_locked();
 #endif
@@ -4669,6 +4811,13 @@ namespace nvhttp {
         }
         if (!rtsp_stream::launch_session_raise(launch_session)) {
           if (launch_session->role == remote_session::role_e::monitor) {
+#ifdef __APPLE__
+            (void) release_mac_remote_monitor(
+              request_client_identity.uuid,
+              launch_session->role_generation,
+              "RTSP admission rejected"
+            );
+#else
             remote_session::release_monitor(
               request_client_identity.uuid,
               launch_session->role_generation,
@@ -4679,6 +4828,7 @@ namespace nvhttp {
               launch_session->role,
               launch_session->role_generation
             );
+#endif
 #if defined(_WIN32) || defined(__linux__)
             cleanup_virtual_display_if_idle();
 #endif
@@ -6609,12 +6759,14 @@ namespace nvhttp {
           for (const auto &[uuid, generation] : expired) {
             if (std::find(active.begin(), active.end(), uuid) != active.end()) continue;
             if (remote_owner_generation(uuid, remote_session::role_e::monitor) != generation) continue;
-            remote_session::release_monitor(uuid, generation, "Disconnected for 30 seconds");
-            forget_remote_owner(uuid, remote_session::role_e::monitor, generation);
+            if (!release_mac_remote_monitor(uuid, generation, "Disconnected for 30 seconds")) continue;
             BOOST_LOG(info) << "Removed disconnected Remote Monitor after grace period"sv;
           }
         }
         if (auto observed = platf::macos_virtual_display::remote_layout_changes()) {
+          std::vector<remote_display_topology::node_t> physical;
+          std::copy_if(observed->begin(), observed->end(), std::back_inserter(physical), [](const auto &node) { return node.physical; });
+          remote_display_topology::instance().set_physical_baseline(std::move(physical));
           if (auto layout = remote_display_topology::instance().remember_positions(*observed)) {
             {
               std::lock_guard lock {client_mutex};
@@ -6794,8 +6946,12 @@ namespace nvhttp {
       if (remote_owner_generation(uuid, remote_session::role_e::monitor) != monitor_generation) {
         return disconnect.disconnected;
       }
+#ifdef __APPLE__
+      (void) release_mac_remote_monitor(uuid, *monitor_generation, "Paired client disconnected");
+#else
       remote_session::release_monitor(uuid, *monitor_generation, "Paired client disconnected");
       forget_remote_owner(uuid, remote_session::role_e::monitor, *monitor_generation);
+#endif
 #if defined(_WIN32) || defined(__linux__)
       cleanup_virtual_display_if_idle_locked();
 #endif
