@@ -1163,9 +1163,6 @@ namespace rtsp_stream {
       std::vector<pending_policy::teardown_reservation_t> teardown_reservations;
       [[maybe_unused]] bool vulkan_hdr_layer_active = false;
 
-      // Serialize the registry-removal linearization point with observers, but
-      // release before stop/join so an unbounded join never owns this gate.
-      std::unique_lock lifecycle_lock(nvhttp::stream_lifecycle_mutex());
       {
         auto lg = _session_state.lock();
 
@@ -1190,7 +1187,6 @@ namespace rtsp_stream {
         }
         vulkan_hdr_layer_active = vulkan_hdr_layer_active_locked();
       }
-      lifecycle_lock.unlock();
       set_vulkan_hdr_layer_streaming_active(vulkan_hdr_layer_active);
 
       // Stop and join outside the lock
@@ -1267,7 +1263,6 @@ namespace rtsp_stream {
       bool removed_pending = false;
       client_disconnect_result_t result;
       [[maybe_unused]] bool vulkan_hdr_layer_active = false;
-      std::unique_lock lifecycle_lock(nvhttp::stream_lifecycle_mutex());
       {
         std::lock_guard<std::mutex> lock {_launch_sessions_mutex};
         for (auto it = _launch_sessions.begin(); it != _launch_sessions.end();) {
@@ -1299,7 +1294,6 @@ namespace rtsp_stream {
         }
         vulkan_hdr_layer_active = vulkan_hdr_layer_active_locked();
       }
-      lifecycle_lock.unlock();
       set_vulkan_hdr_layer_streaming_active(vulkan_hdr_layer_active);
 
       for (auto &slot : to_cleanup) {
