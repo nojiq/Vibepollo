@@ -73,7 +73,6 @@ class Settings:
     idle_disconnect_seconds: float = 30.0
     backoff_base_seconds: int = 5
     backoff_max_seconds: int = 120
-    startup_grace_seconds: float = 15.0
     startup_timeout_seconds: float = 45.0
     health_absence_grace_seconds: float = 5.0
     tls_ports: tuple[int, ...] = (47984, 47990)
@@ -116,9 +115,6 @@ class Settings:
             ),
             backoff_base_seconds=max(1, integer("MOONLIGHT_BACKOFF_BASE_SECONDS", cls.backoff_base_seconds)),
             backoff_max_seconds=max(1, integer("MOONLIGHT_BACKOFF_MAX_SECONDS", cls.backoff_max_seconds)),
-            startup_grace_seconds=max(
-                1.0, number("MOONLIGHT_STARTUP_GRACE_SECONDS", cls.startup_grace_seconds)
-            ),
             startup_timeout_seconds=max(
                 1.0, number("MOONLIGHT_STARTUP_TIMEOUT_SECONDS", cls.startup_timeout_seconds)
             ),
@@ -550,7 +546,7 @@ class ReconnectController:
 
         now = self.monotonic()
         present = self.network_present()
-        self._observe_process(present, now)
+        self._observe_process(now)
 
         if not present:
             if self.absent_since is None:
@@ -593,20 +589,13 @@ class ReconnectController:
             self.next_retry_at = now + delay
             self.logger.info("reconnect attempt failed; retrying in %ss", delay)
 
-    def _observe_process(self, present: bool, now: float) -> None:
+    def _observe_process(self, now: float) -> None:
         if self.process is None:
             return
         exit_code = self.process.poll()
         if exit_code is None:
             return
-        started_at = self.process_started_at
         self._clear_process_state()
-        if exit_code == 0 and present and (
-            started_at is None or now - started_at >= self.settings.startup_grace_seconds
-        ):
-            self.manual_hold = True
-            self.logger.info("Moonlight exited cleanly; holding until network transition or service restart")
-            return
         self._schedule_retry(now, "Moonlight exited with status %s", exit_code)
 
     def _schedule_retry(self, now: float, message: str, *message_args: object) -> None:

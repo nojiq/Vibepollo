@@ -310,7 +310,7 @@ UNCONN 0 0 192.168.8.134:42003 0.0.0.0:* users:((\"moonlight\",pid=101,fd=44))
         controller.step()
         self.assertTrue(process.terminated)
 
-    def test_clean_manual_quit_is_held_until_network_transition(self):
+    def test_owned_clean_exit_retries_with_backoff(self):
         class FakeProcess:
             def poll(self):
                 return 0
@@ -332,36 +332,34 @@ UNCONN 0 0 192.168.8.134:42003 0.0.0.0:* users:((\"moonlight\",pid=101,fd=44))
         controller = FakeController()
         controller.process = FakeProcess()
         controller.step()
-        controller.step()
         self.assertEqual(controller.starts, 0)
-        controller.present = False
-        controller.step()
-        controller.present = True
-        controller.step()
+        controller.now = 5
         controller.step()
         self.assertEqual(controller.starts, 1)
 
-    def test_clean_exit_during_startup_is_retried(self):
-        class FakeProcess:
-            def poll(self):
-                return 0
-
+    def test_preexisting_stream_is_left_in_manual_hold(self):
         class FakeController(module.ReconnectController):
-            def __init__(self):
-                super().__init__(module.Settings(startup_grace_seconds=15), monotonic=lambda: self.now)
-                self.now = 5
-                self.present = True
-
             def network_present(self):
-                return self.present
+                return True
 
-        controller = FakeController()
-        controller.process = FakeProcess()
-        controller.process_started_at = 0
-        controller.step()
+            def attempt_start(self):
+                self.starts += 1
+                return False
 
-        self.assertFalse(controller.manual_hold)
-        self.assertEqual(controller.next_retry_at, 10)
+            def __init__(self, proc_root):
+                super().__init__(module.Settings(), proc_root=proc_root)
+                self.starts = 0
+
+        with tempfile.TemporaryDirectory() as proc_root:
+            pid_dir = pathlib.Path(proc_root) / "101"
+            pid_dir.mkdir()
+            (pid_dir / "cmdline").write_bytes(b"moonlight\0stream\0Resume\0")
+            controller = FakeController(proc_root)
+            controller.step()
+            controller.step()
+
+        self.assertTrue(controller.manual_hold)
+        self.assertEqual(controller.starts, 0)
 
     def test_lingering_failed_cli_is_restarted_after_startup_deadline(self):
         class FakeProcess:

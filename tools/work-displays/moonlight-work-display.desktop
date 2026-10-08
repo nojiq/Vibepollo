@@ -6,3 +6,8 @@ Exec=systemctl --user restart moonlight-remote-monitor.service
 Icon=com.moonlight_stream.Moonlight
 Terminal=false
 Categories=Network;RemoteAccess;
+Actions=Stop;
+
+[Desktop Action Stop]
+Name=Stop Work Display
+Exec=systemctl --user stop moonlight-remote-monitor.service

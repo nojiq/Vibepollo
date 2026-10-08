@@ -29,9 +29,8 @@ The helper:
   after 5 seconds of host loss; after startup, a known zero-socket session is
   restarted after the same 5-second grace, while an unavailable `ss` probe is
   treated as unknown and never kills a healthy stream;
-- treats a clean Moonlight exit as a manual quit and waits for a network
-  transition or an explicit service restart before reconnecting; clean exits
-  during the first 15 seconds are treated as startup failures and retried.
+- retries every exit from a stream it started, including a clean exit during a
+  host restart; a pre-existing Moonlight stream is left alone in manual hold.
 
 It never writes `Moonlight.conf`, changes pairing, or modifies Moonlight's
 video settings. The stream flags are the existing Surface profile:
@@ -65,8 +64,6 @@ MOONLIGHT_HOST_PROFILE="Mac - Extended Displays"
 MOONLIGHT_COMPANY_NETWORKS=192.168.8.0/24
 MOONLIGHT_TRUSTED_SSIDS=JKS_2.4G,JKS_5G
 MOONLIGHT_IDLE_DISCONNECT_SECONDS=30
-# Clean exits before this age are retried instead of treated as manual quit.
-MOONLIGHT_STARTUP_GRACE_SECONDS=15
 # Kill/retry a live Moonlight GUI that never creates a streaming UDP session.
 MOONLIGHT_STARTUP_TIMEOUT_SECONDS=45
 # Host certificate health must fail continuously for this long after startup.
@@ -89,7 +86,7 @@ journalctl --user -u moonlight-remote-monitor.service -f
 Do not add `JKS_Guest_2.4G` unless that network is intentionally trusted. The
 helper accepts the currently used wired company connection by subnet.
 
-For one-click resume after manually quitting, install the optional app-menu entry:
+Install the optional app-menu entry for restart and explicit stop actions:
 
 ```bash
 install -Dm644 moonlight-work-display.desktop ~/.local/share/applications/moonlight-work-display.desktop
@@ -100,6 +97,16 @@ Open **Mac Work Display** from the app menu. The equivalent command is:
 ```bash
 systemctl --user restart moonlight-remote-monitor.service
 ```
+
+Closing a Moonlight stream started by this helper reconnects automatically after
+the bounded retry delay. Choose **Stop Work Display** from the same app-menu
+entry, or run the command below, when you want to opt out:
+
+```bash
+systemctl --user stop moonlight-remote-monitor.service
+```
+
+Starting or restarting the service resumes automatic reconnect.
 
 To stop automatic reconnect without touching Moonlight pairing:
 
