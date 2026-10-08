@@ -19,8 +19,11 @@ The helper:
   seconds by default);
 - stops the stream it started after 30 seconds outside the company network;
 - uses an advisory lock and `/proc` scan to avoid starting a second stream;
+- starts Moonlight in its own process group, so disconnect cleanup cannot kill
+  unrelated desktop processes;
 - treats a clean Moonlight exit as a manual quit and waits for a network
-  transition or an explicit service restart before reconnecting.
+  transition or an explicit service restart before reconnecting; clean exits
+  during the first 15 seconds are treated as startup failures and retried.
 
 It never writes `Moonlight.conf`, changes pairing, or modifies Moonlight's
 video settings. The stream flags are the existing Surface profile:
@@ -48,6 +51,8 @@ MOONLIGHT_HOST_PROFILE="Mac - Extended Displays"
 MOONLIGHT_COMPANY_NETWORKS=192.168.8.0/24
 MOONLIGHT_TRUSTED_SSIDS=JKS_2.4G,JKS_5G
 MOONLIGHT_IDLE_DISCONNECT_SECONDS=30
+# Clean exits before this age are retried instead of treated as manual quit.
+MOONLIGHT_STARTUP_GRACE_SECONDS=15
 ```
 
 Disable the old one-shot GUI autostart before enabling the service. Keep a

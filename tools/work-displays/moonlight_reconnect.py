@@ -25,6 +25,22 @@ import time
 from typing import Iterable
 
 
+def parse_tls_ports(raw: str | None, default: tuple[int, ...] = (47984, 47990)) -> tuple[int, ...]:
+    """Parse literal decimal TLS ports from the environment."""
+
+    if raw is None:
+        return default
+    ports: list[int] = []
+    for item in raw.split(","):
+        try:
+            port = int(item.strip(), 10)
+        except ValueError:
+            continue
+        if 1 <= port <= 65535:
+            ports.append(port)
+    return tuple(dict.fromkeys(ports)) or default
+
+
 @dataclasses.dataclass(frozen=True)
 class HostProfile:
     """The non-secret parts of one host entry in Moonlight.conf."""
@@ -53,6 +69,7 @@ class Settings:
     idle_disconnect_seconds: float = 30.0
     backoff_base_seconds: int = 5
     backoff_max_seconds: int = 120
+    startup_grace_seconds: float = 15.0
     tls_ports: tuple[int, ...] = (47984, 47990)
     command_timeout_seconds: float = 20.0
 
@@ -81,11 +98,6 @@ class Settings:
             except ValueError:
                 return default
 
-        ports = tuple(
-            integer_value
-            for integer_value in (integer(item, 0) for item in values("MOONLIGHT_TLS_PORTS", ("47984", "47990")))
-            if integer_value > 0
-        )
         return cls(
             host_profile_name=text("MOONLIGHT_HOST_PROFILE", cls.host_profile_name),
             config_path=text("MOONLIGHT_CONFIG", cls.config_path),
@@ -98,7 +110,10 @@ class Settings:
             ),
             backoff_base_seconds=max(1, integer("MOONLIGHT_BACKOFF_BASE_SECONDS", cls.backoff_base_seconds)),
             backoff_max_seconds=max(1, integer("MOONLIGHT_BACKOFF_MAX_SECONDS", cls.backoff_max_seconds)),
-            tls_ports=ports or cls.tls_ports,
+            startup_grace_seconds=max(
+                1.0, number("MOONLIGHT_STARTUP_GRACE_SECONDS", cls.startup_grace_seconds)
+            ),
+            tls_ports=parse_tls_ports(os.environ.get("MOONLIGHT_TLS_PORTS"), cls.tls_ports),
             command_timeout_seconds=max(
                 1.0, number("MOONLIGHT_COMMAND_TIMEOUT_SECONDS", cls.command_timeout_seconds)
             ),
@@ -402,6 +417,7 @@ class ReconnectController:
         self.logger = logger or logging.getLogger("moonlight-reconnect")
         self.proc_root = proc_root
         self.process = None
+        self.process_started_at: float | None = None
         self.absent_since: float | None = None
         self.manual_hold = False
         self.retry_attempt = 0
@@ -484,7 +500,11 @@ class ReconnectController:
         if exit_code is None:
             return
         self.process = None
-        if exit_code == 0 and present:
+        started_at = self.process_started_at
+        self.process_started_at = None
+        if exit_code == 0 and present and (
+            started_at is None or now - started_at >= self.settings.startup_grace_seconds
+        ):
             self.manual_hold = True
             self.logger.info("Moonlight exited cleanly; holding until network transition or service restart")
             return
@@ -576,9 +596,10 @@ class ReconnectController:
             environment = os.environ.copy()
             environment["VIBEPOLLO_MOONLIGHT_RECONNECT_OWNER"] = "1"
             try:
-                self.process = self.process_factory(command, env=environment)
+                self.process = self.process_factory(command, env=environment, start_new_session=True)
             except OSError:
                 return False
+            self.process_started_at = self.monotonic()
             self.logger.info("started %s on paired host %s", app, address)
             return True
         return False
@@ -588,15 +609,31 @@ class ReconnectController:
             return
         process = self.process
         self.process = None
+        self.process_started_at = None
         try:
-            process.terminate()
+            self._signal_owned_process(process, signal.SIGTERM, "terminate")
             process.wait(timeout=5)
         except (OSError, subprocess.SubprocessError, TimeoutError):
             try:
-                process.kill()
+                self._signal_owned_process(process, signal.SIGKILL, "kill")
                 process.wait(timeout=2)
             except (OSError, subprocess.SubprocessError, TimeoutError):
                 pass
+
+    @staticmethod
+    def _signal_owned_process(process, signum: int, fallback: str) -> None:
+        """Signal only the session created for our Flatpak launcher."""
+
+        process_id = getattr(process, "pid", None)
+        if isinstance(process_id, int) and process_id > 0:
+            try:
+                os.killpg(process_id, signum)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                pass
+        getattr(process, fallback)()
 
     def run_forever(self) -> None:
         """Run until SIGTERM/SIGINT calls ``stop``."""

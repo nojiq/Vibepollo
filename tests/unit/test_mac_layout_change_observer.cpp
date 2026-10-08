@@ -54,3 +54,15 @@ TEST(MacLayoutMemory, KeepsUserMoveMadeDuringReconnectSettling) {
   EXPECT_FALSE(observer.observe(moved, start + 2s));
   EXPECT_TRUE(observer.observe(moved, start + 3s));
 }
+
+TEST(MacLayoutMemory, KeepsMoveOfRemainingDisplayAfterRemoval) {
+  observer_t observer;
+  observer.topology_changed(start, initial);
+  observer.display_removed("msi", start + 1s);
+  auto moved = initial;
+  moved.erase("msi");
+  moved["surface"] = {1920, 300, 2160, 1440};
+  EXPECT_FALSE(observer.observe(moved, start + 2s));
+  EXPECT_FALSE(observer.observe(moved, start + 3s));
+  EXPECT_TRUE(observer.observe(moved, start + 4s));
+}

@@ -804,6 +804,19 @@ namespace platf::macos_virtual_display {
       }
       return "Display "s + std::to_string(id);
     }
+
+    std::string physical_identity(const CGDirectDisplayID id) {
+      using display_uuid_fn = CFUUIDRef (*)(CGDirectDisplayID);
+      static const auto create_uuid = reinterpret_cast<display_uuid_fn>(dlsym(RTLD_DEFAULT, "CGDisplayCreateUUIDFromDisplayID"));
+      CFUUIDRef uuid = create_uuid ? create_uuid(id) : nullptr;
+      if (!uuid) return "display-" + std::to_string(id);
+      CFStringRef text = CFUUIDCreateString(kCFAllocatorDefault, uuid);
+      char buffer[128] {};
+      const bool copied = text && CFStringGetCString(text, buffer, sizeof(buffer), kCFStringEncodingUTF8);
+      if (text) CFRelease(text);
+      CFRelease(uuid);
+      return copied ? std::string {buffer} : "display-" + std::to_string(id);
+    }
   }  // namespace
 
   bool remote_create_or_reclaim(const std::string &client_uuid, const std::string &client_label, const remote_display_topology::mode_t &mode) {
@@ -877,7 +890,7 @@ namespace platf::macos_virtual_display {
 
   bool remote_remove_owned_display(const std::string &client_uuid) {
     std::lock_guard lock {remote_mutex};
-    layout_observer.topology_changed(std::chrono::steady_clock::now());
+    layout_observer.display_removed(client_uuid, std::chrono::steady_clock::now());
     remote_displays.erase(client_uuid);
     publish_remote_ids();
     return true;
@@ -892,7 +905,8 @@ namespace platf::macos_virtual_display {
       const CGRect bounds = CGDisplayBounds(id);
       const auto [pixel_width, pixel_height] = current_pixels(id);
       remote_display_topology::node_t node;
-      node.id = node.device_id = std::to_string(id);
+      node.id = physical_identity(id);
+      node.device_id = std::to_string(id);
       node.label = display_label(id);
       node.preexisting = true;
       node.physical = id != current_id.load();

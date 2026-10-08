@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <limits>
 
 #include "src/remote_display_topology.h"
 #include "src/platform/linux/private_display_resume_policy.h"
@@ -947,6 +948,7 @@ TEST(RemoteDisplayTopology, RejectsPartialNonIntegerAndOutOfBoundsOffsets) {
          { {"anchor_kind", "physical"}, {"anchor_id", "main"}, {"edge", "right"}, {"alignment", "center"}, {"gap_px", 0}, {"offset_x", 1} },
          { {"anchor_kind", "physical"}, {"anchor_id", "main"}, {"edge", "right"}, {"alignment", "center"}, {"gap_px", 0}, {"offset_x", "1"}, {"offset_y", 0} },
          { {"anchor_kind", "physical"}, {"anchor_id", "main"}, {"edge", "right"}, {"alignment", "center"}, {"gap_px", 0}, {"offset_x", 100001}, {"offset_y", 0} },
+         { {"anchor_kind", "physical"}, {"anchor_id", "main"}, {"edge", "right"}, {"alignment", "center"}, {"gap_px", 0}, {"offset_x", std::numeric_limits<std::uint64_t>::max()}, {"offset_y", 0} },
        }) {
     std::string error;
     EXPECT_FALSE(remote_display_topology::validate_layout(layout({{"one", placement}}), known_clients, physical, error));

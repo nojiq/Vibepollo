@@ -22,6 +22,12 @@ namespace platf::macos_virtual_display {
       candidate_.reset();
     }
 
+    void display_removed(const std::string &uuid, clock::time_point now) {
+      settle_until_ = now + std::chrono::seconds(2);
+      if (baseline_) baseline_->erase(uuid);
+      candidate_.reset();
+    }
+
     bool observe(const positions_t &positions, clock::time_point now) {
       if (now < settle_until_) return false;
       if (!baseline_) {

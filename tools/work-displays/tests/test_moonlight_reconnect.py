@@ -4,6 +4,7 @@ import base64
 import tempfile
 import sys
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).parents[1] / "moonlight_reconnect.py"
@@ -170,6 +171,10 @@ wlp2s0:wifi:connected:JKS_5G
 
 
 class RetryTests(unittest.TestCase):
+    def test_tls_port_parser_accepts_decimal_literals_only(self):
+        self.assertEqual(module.parse_tls_ports("47990, 47984"), (47990, 47984))
+        self.assertEqual(module.parse_tls_ports("bad, 0, 70000"), (47984, 47990))
+
     def test_backoff_is_bounded_and_resets(self):
         values = [module.backoff_seconds(i, base=2, maximum=30) for i in range(8)]
 
@@ -183,6 +188,42 @@ class RetryTests(unittest.TestCase):
 
 
 class ProcessAndControllerTests(unittest.TestCase):
+    def test_owned_process_uses_its_process_group(self):
+        process = mock.Mock(pid=1234)
+
+        with mock.patch.object(module.os, "killpg") as killpg:
+            module.ReconnectController._signal_owned_process(process, module.signal.SIGTERM, "terminate")
+
+        killpg.assert_called_once_with(1234, module.signal.SIGTERM)
+        process.terminate.assert_not_called()
+
+    def test_stream_launcher_starts_a_new_process_session(self):
+        profile = module.HostProfile(
+            index=1,
+            name="Mac - Extended Displays",
+            manual_address="192.168.8.150",
+            server_certificate="pinned",
+        )
+        launch = {}
+
+        def process_factory(command, **kwargs):
+            launch["command"] = command
+            launch["kwargs"] = kwargs
+            return mock.Mock(pid=2222)
+
+        class FakeController(module.ReconnectController):
+            def _profile(self):
+                return profile
+
+            def _list_apps(self, _address):
+                return ("Resume",)
+
+        controller = FakeController(module.Settings(), process_factory=process_factory)
+        with mock.patch.object(module, "verify_pinned_host", return_value=True):
+            self.assertTrue(controller.attempt_start())
+
+        self.assertTrue(launch["kwargs"]["start_new_session"])
+
     def test_existing_stream_scan_finds_flatpak_moonlight_stream_once(self):
         with tempfile.TemporaryDirectory() as proc_root:
             for pid, command in {
@@ -265,6 +306,28 @@ class ProcessAndControllerTests(unittest.TestCase):
         controller.step()
         controller.step()
         self.assertEqual(controller.starts, 1)
+
+    def test_clean_exit_during_startup_is_retried(self):
+        class FakeProcess:
+            def poll(self):
+                return 0
+
+        class FakeController(module.ReconnectController):
+            def __init__(self):
+                super().__init__(module.Settings(startup_grace_seconds=15), monotonic=lambda: self.now)
+                self.now = 5
+                self.present = True
+
+            def network_present(self):
+                return self.present
+
+        controller = FakeController()
+        controller.process = FakeProcess()
+        controller.process_started_at = 0
+        controller.step()
+
+        self.assertFalse(controller.manual_hold)
+        self.assertEqual(controller.next_retry_at, 10)
 
 
 if __name__ == "__main__":
